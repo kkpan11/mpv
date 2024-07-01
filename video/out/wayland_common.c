@@ -119,7 +119,7 @@ static const struct mp_keymap keymap[] = {
     /* Numpad without numlock */
     {XKB_KEY_KP_Insert, MP_KEY_KPINS},   {XKB_KEY_KP_End,       MP_KEY_KPEND},
     {XKB_KEY_KP_Down,   MP_KEY_KPDOWN},  {XKB_KEY_KP_Page_Down, MP_KEY_KPPGDOWN},
-    {XKB_KEY_KP_Left,   MP_KEY_KPLEFT},  {XKB_KEY_KP_Begin,     MP_KEY_KP5},
+    {XKB_KEY_KP_Left,   MP_KEY_KPLEFT},  {XKB_KEY_KP_Begin,     MP_KEY_KPBEGIN},
     {XKB_KEY_KP_Right,  MP_KEY_KPRIGHT}, {XKB_KEY_KP_Home,      MP_KEY_KPHOME},
     {XKB_KEY_KP_Up,     MP_KEY_KPUP},    {XKB_KEY_KP_Page_Up,   MP_KEY_KPPGUP},
     {XKB_KEY_KP_Delete, MP_KEY_KPDEL},
@@ -154,6 +154,7 @@ const struct m_sub_options wayland_conf = {
             M_RANGE(0, INT_MAX)},
         {"wayland-edge-pixels-touch", OPT_INT(edge_pixels_touch),
             M_RANGE(0, INT_MAX)},
+        {"wayland-present", OPT_BOOL(present)},
         {0},
     },
     .size = sizeof(struct wayland_opts),
@@ -161,6 +162,7 @@ const struct m_sub_options wayland_conf = {
         .configure_bounds = -1,
         .edge_pixels_pointer = 16,
         .edge_pixels_touch = 32,
+        .present = true,
     },
 };
 
@@ -211,6 +213,9 @@ struct vo_wayland_seat {
     bool axis_value120_scroll;
     bool has_keyboard_input;
     struct wl_list link;
+    bool keyboard_entering;
+    uint32_t *keyboard_entering_keys;
+    int num_keyboard_entering_keys;
 };
 
 static bool single_output_spanned(struct vo_wayland_state *wl);
@@ -219,7 +224,7 @@ static int check_for_resize(struct vo_wayland_state *wl, int edge_pixels,
                             enum xdg_toplevel_resize_edge *edge);
 static int get_mods(struct vo_wayland_seat *seat);
 static int greatest_common_divisor(int a, int b);
-static int lookupkey(int key);
+static void handle_key_input(struct vo_wayland_seat *s, uint32_t key, uint32_t state);
 static int set_cursor_visibility(struct vo_wayland_seat *s, bool on);
 static int spawn_cursor(struct vo_wayland_state *wl);
 
@@ -440,19 +445,17 @@ static void touch_handle_down(void *data, struct wl_touch *wl_touch,
 {
     struct vo_wayland_seat *s = data;
     struct vo_wayland_state *wl = s->wl;
+    // Note: the position should still be saved here for VO dragging handling.
     wl->mouse_x = wl_fixed_to_int(x_w) * wl->scaling;
     wl->mouse_y = wl_fixed_to_int(y_w) * wl->scaling;
 
-    mp_input_set_mouse_pos(wl->vo->input_ctx, wl->mouse_x, wl->mouse_y);
-    mp_input_put_key(wl->vo->input_ctx, MP_MBTN_LEFT | MP_KEY_STATE_DOWN);
+    mp_input_add_touch_point(wl->vo->input_ctx, id, wl->mouse_x, wl->mouse_y);
 
     enum xdg_toplevel_resize_edge edge;
     if (!mp_input_test_dragging(wl->vo->input_ctx, wl->mouse_x, wl->mouse_y) &&
         !wl->locked_size && check_for_resize(wl, wl->opts->edge_pixels_touch, &edge))
     {
         xdg_toplevel_resize(wl->xdg_toplevel, s->seat, serial, edge);
-        // Explicitly send an UP event after the client finishes a resize
-        mp_input_put_key(wl->vo->input_ctx, MP_MBTN_LEFT | MP_KEY_STATE_UP);
     } else {
         // Save the serial and seat for voctrl-initialized dragging requests.
         s->pointer_button_serial = serial;
@@ -465,7 +468,7 @@ static void touch_handle_up(void *data, struct wl_touch *wl_touch,
 {
     struct vo_wayland_seat *s = data;
     struct vo_wayland_state *wl = s->wl;
-    mp_input_put_key(wl->vo->input_ctx, MP_MBTN_LEFT | MP_KEY_STATE_UP);
+    mp_input_remove_touch_point(wl->vo->input_ctx, id);
     wl->last_button_seat = NULL;
 }
 
@@ -478,7 +481,7 @@ static void touch_handle_motion(void *data, struct wl_touch *wl_touch,
     wl->mouse_x = wl_fixed_to_int(x_w) * wl->scaling;
     wl->mouse_y = wl_fixed_to_int(y_w) * wl->scaling;
 
-    mp_input_set_mouse_pos(wl->vo->input_ctx, wl->mouse_x, wl->mouse_y);
+    mp_input_update_touch_point(wl->vo->input_ctx, id, wl->mouse_x, wl->mouse_y);
 }
 
 static void touch_handle_frame(void *data, struct wl_touch *wl_touch)
@@ -487,6 +490,9 @@ static void touch_handle_frame(void *data, struct wl_touch *wl_touch)
 
 static void touch_handle_cancel(void *data, struct wl_touch *wl_touch)
 {
+    struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
+    mp_input_put_key(wl->vo->input_ctx, MP_TOUCH_RELEASE_ALL);
 }
 
 static void touch_handle_shape(void *data, struct wl_touch *wl_touch,
@@ -557,7 +563,12 @@ static void keyboard_handle_enter(void *data, struct wl_keyboard *wl_keyboard,
     struct vo_wayland_seat *s = data;
     struct vo_wayland_state *wl = s->wl;
     s->has_keyboard_input = true;
+    s->keyboard_entering = true;
     guess_focus(wl);
+
+    uint32_t *key;
+    wl_array_for_each(key, keys)
+        MP_TARRAY_APPEND(s, s->keyboard_entering_keys, s->num_keyboard_entering_keys, *key);
 }
 
 static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
@@ -578,36 +589,7 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
                                 uint32_t state)
 {
     struct vo_wayland_seat *s = data;
-    struct vo_wayland_state *wl = s->wl;
-
-    s->keyboard_code = key + 8;
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, s->keyboard_code);
-    int mpkey = lookupkey(sym);
-
-    state = state == WL_KEYBOARD_KEY_STATE_PRESSED ? MP_KEY_STATE_DOWN
-                                                   : MP_KEY_STATE_UP;
-
-    if (mpkey) {
-        mp_input_put_key(wl->vo->input_ctx, mpkey | state | s->mpmod);
-    } else {
-        char str[128];
-        if (xkb_keysym_to_utf8(sym, str, sizeof(str)) > 0) {
-            mp_input_put_key_utf8(wl->vo->input_ctx, state | s->mpmod, bstr0(str));
-        } else {
-            // Assume a modifier was pressed and handle it in the mod event instead.
-            // If a modifier is released before a regular key, also release that
-            // key to not activate it again by accident.
-            if (state == MP_KEY_STATE_UP) {
-                s->mpkey = 0;
-                mp_input_put_key(wl->vo->input_ctx, MP_INPUT_RELEASE_ALL);
-            }
-            return;
-        }
-    }
-    if (state == MP_KEY_STATE_DOWN)
-        s->mpkey = mpkey;
-    if (mpkey && state == MP_KEY_STATE_UP)
-        s->mpkey = 0;
+    handle_key_input(s, key, state);
 }
 
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
@@ -622,8 +604,15 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
         xkb_state_update_mask(s->xkb_state, mods_depressed, mods_latched,
                               mods_locked, 0, 0, group);
         s->mpmod = get_mods(s);
-        if (s->mpkey)
-            mp_input_put_key(wl->vo->input_ctx, s->mpkey | MP_KEY_STATE_DOWN | s->mpmod);
+    }
+    // Handle keys pressed during the enter event.
+    if (s->keyboard_entering) {
+        s->keyboard_entering = false;
+        for (int n = 0; n < s->num_keyboard_entering_keys; n++)
+            handle_key_input(s, s->keyboard_entering_keys[n], WL_KEYBOARD_KEY_STATE_PRESSED);
+        s->num_keyboard_entering_keys = 0;
+    } else if (s->xkb_state && s->mpkey) {
+        mp_input_put_key(wl->vo->input_ctx, s->mpkey | MP_KEY_STATE_DOWN | s->mpmod);
     }
 }
 
@@ -1010,6 +999,9 @@ static void surface_handle_preferred_buffer_scale(void *data,
     // Update scaling now.
     if (single_output_spanned(wl))
         update_output_scaling(wl);
+
+    if (!wl->current_output)
+        wl->scaling = wl->pending_scaling;
 }
 
 static void surface_handle_preferred_buffer_transform(void *data,
@@ -1235,6 +1227,9 @@ static void preferred_scale(void *data,
     // Update scaling now.
     if (single_output_spanned(wl))
         update_output_scaling(wl);
+
+    if (!wl->current_output)
+        wl->scaling = wl->pending_scaling;
 }
 
 static const struct wp_fractional_scale_v1_listener fractional_scale_listener = {
@@ -1290,7 +1285,7 @@ static void pres_set_clockid(void *data, struct wp_presentation *pres,
     struct vo_wayland_state *wl = data;
 
     if (clockid == CLOCK_MONOTONIC || clockid == CLOCK_MONOTONIC_RAW)
-        wl->use_present = true;
+        wl->present_clock = true;
 }
 
 static const struct wp_presentation_listener pres_listener = {
@@ -1356,6 +1351,7 @@ static void frame_callback(void *data, struct wl_callback *callback, uint32_t ti
     wl->frame_callback = wl_surface_frame(wl->callback_surface);
     wl_callback_add_listener(wl->frame_callback, &frame_listener, wl);
 
+    wl->use_present = wl->present_clock && wl->opts->present;
     if (wl->use_present) {
         struct wp_presentation_feedback *fback = wp_presentation_feedback(wl->presentation, wl->callback_surface);
         add_feedback(wl->fback_pool, fback);
@@ -1457,20 +1453,27 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
         wl_surface_add_listener(wl->surface, &surface_listener, wl);
     }
 
-    if (!strcmp(interface, wl_subcompositor_interface.name) && (ver >= 1) && found++)
-        wl->subcompositor = wl_registry_bind(reg, id, &wl_subcompositor_interface, 1);
+    if (!strcmp(interface, wl_subcompositor_interface.name) && found++) {
+        ver = 1;
+        wl->subcompositor = wl_registry_bind(reg, id, &wl_subcompositor_interface, ver);
+    }
 
     if (!strcmp (interface, zwp_linux_dmabuf_v1_interface.name) && (ver >= 4) && found++) {
-        wl->dmabuf = wl_registry_bind(reg, id, &zwp_linux_dmabuf_v1_interface, 4);
+        ver = 4;
+        wl->dmabuf = wl_registry_bind(reg, id, &zwp_linux_dmabuf_v1_interface, ver);
         wl->dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(wl->dmabuf);
         zwp_linux_dmabuf_feedback_v1_add_listener(wl->dmabuf_feedback, &dmabuf_feedback_listener, wl);
     }
 
-    if (!strcmp (interface, wp_viewporter_interface.name) && (ver >= 1) && found++)
-        wl->viewporter = wl_registry_bind (reg, id, &wp_viewporter_interface, 1);
+    if (!strcmp (interface, wp_viewporter_interface.name) && found++) {
+        ver = 1;
+        wl->viewporter = wl_registry_bind (reg, id, &wp_viewporter_interface, ver);
+    }
 
-    if (!strcmp(interface, wl_data_device_manager_interface.name) && (ver >= 3) && found++)
-        wl->dnd_devman = wl_registry_bind(reg, id, &wl_data_device_manager_interface, 3);
+    if (!strcmp(interface, wl_data_device_manager_interface.name) && (ver >= 3) && found++) {
+        ver = 3;
+        wl->dnd_devman = wl_registry_bind(reg, id, &wl_data_device_manager_interface, ver);
+    }
 
     if (!strcmp(interface, wl_output_interface.name) && (ver >= 2) && found++) {
         struct vo_wayland_output *output = talloc_zero(wl, struct vo_wayland_output);
@@ -1503,46 +1506,65 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
         wl_list_insert(&wl->seat_list, &seat->link);
     }
 
-    if (!strcmp(interface, wl_shm_interface.name) && found++)
-        wl->shm = wl_registry_bind(reg, id, &wl_shm_interface, 1);
+    if (!strcmp(interface, wl_shm_interface.name) && found++) {
+        ver = 1;
+        wl->shm = wl_registry_bind(reg, id, &wl_shm_interface, ver);
+    }
 
 #if HAVE_WAYLAND_PROTOCOLS_1_27
-    if (!strcmp(interface, wp_content_type_manager_v1_interface.name) && found++)
-        wl->content_type_manager = wl_registry_bind(reg, id, &wp_content_type_manager_v1_interface, 1);
+    if (!strcmp(interface, wp_content_type_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->content_type_manager = wl_registry_bind(reg, id, &wp_content_type_manager_v1_interface, ver);
+    }
 
-    if (!strcmp(interface, wp_single_pixel_buffer_manager_v1_interface.name) && found++)
-        wl->single_pixel_manager = wl_registry_bind(reg, id, &wp_single_pixel_buffer_manager_v1_interface, 1);
+    if (!strcmp(interface, wp_single_pixel_buffer_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->single_pixel_manager = wl_registry_bind(reg, id, &wp_single_pixel_buffer_manager_v1_interface, ver);
+    }
 #endif
 
 #if HAVE_WAYLAND_PROTOCOLS_1_31
-    if (!strcmp(interface, wp_fractional_scale_manager_v1_interface.name) && found++)
-        wl->fractional_scale_manager = wl_registry_bind(reg, id, &wp_fractional_scale_manager_v1_interface, 1);
+    if (!strcmp(interface, wp_fractional_scale_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->fractional_scale_manager = wl_registry_bind(reg, id, &wp_fractional_scale_manager_v1_interface, ver);
+    }
 #endif
 
 #if HAVE_WAYLAND_PROTOCOLS_1_32
-    if (!strcmp(interface, wp_cursor_shape_manager_v1_interface.name) && found++)
-        wl->cursor_shape_manager = wl_registry_bind(reg, id, &wp_cursor_shape_manager_v1_interface, 1);
+    if (!strcmp(interface, wp_cursor_shape_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->cursor_shape_manager = wl_registry_bind(reg, id, &wp_cursor_shape_manager_v1_interface, ver);
+    }
 #endif
 
     if (!strcmp(interface, wp_presentation_interface.name) && found++) {
-        wl->presentation = wl_registry_bind(reg, id, &wp_presentation_interface, 1);
+        ver = 1;
+        wl->presentation = wl_registry_bind(reg, id, &wp_presentation_interface, ver);
         wp_presentation_add_listener(wl->presentation, &pres_listener, wl);
     }
 
     if (!strcmp(interface, xdg_wm_base_interface.name) && found++) {
+#ifdef XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION
         ver = MPMIN(ver, 6); /* Cap at 6 in case new events are added later. */
+#else
+        ver = MPMIN(ver, 4);
+#endif
         wl->wm_base = wl_registry_bind(reg, id, &xdg_wm_base_interface, ver);
         xdg_wm_base_add_listener(wl->wm_base, &xdg_wm_base_listener, wl);
     }
 
-    if (!strcmp(interface, zxdg_decoration_manager_v1_interface.name) && found++)
-        wl->xdg_decoration_manager = wl_registry_bind(reg, id, &zxdg_decoration_manager_v1_interface, 1);
+    if (!strcmp(interface, zxdg_decoration_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->xdg_decoration_manager = wl_registry_bind(reg, id, &zxdg_decoration_manager_v1_interface, ver);
+    }
 
-    if (!strcmp(interface, zwp_idle_inhibit_manager_v1_interface.name) && found++)
-        wl->idle_inhibit_manager = wl_registry_bind(reg, id, &zwp_idle_inhibit_manager_v1_interface, 1);
+    if (!strcmp(interface, zwp_idle_inhibit_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->idle_inhibit_manager = wl_registry_bind(reg, id, &zwp_idle_inhibit_manager_v1_interface, ver);
+    }
 
     if (found > 1)
-        MP_VERBOSE(wl, "Registered for protocol %s\n", interface);
+        MP_VERBOSE(wl, "Registered interface %s at version %d\n", interface, ver);
 }
 
 static void registry_handle_remove(void *data, struct wl_registry *reg, uint32_t id)
@@ -1820,10 +1842,10 @@ static void guess_focus(struct vo_wayland_state *wl)
 
     if ((!wl->focused && wl->activated && has_keyboard_input) ||
         (wl->focused && !wl->activated))
-     {
-         wl->focused = !wl->focused;
-         wl->pending_vo_events |= VO_EVENT_FOCUS;
-     }
+    {
+        wl->focused = !wl->focused;
+        wl->pending_vo_events |= VO_EVENT_FOCUS;
+    }
 }
 
 static struct vo_wayland_output *find_output(struct vo_wayland_state *wl)
@@ -1871,6 +1893,49 @@ static int lookupkey(int key)
         mpkey = lookup_keymap_table(keymap, key);
 
     return mpkey;
+}
+
+static void handle_key_input(struct vo_wayland_seat *s, uint32_t key,
+                             uint32_t state)
+{
+    struct vo_wayland_state *wl = s->wl;
+
+    switch (state) {
+    case WL_KEYBOARD_KEY_STATE_RELEASED:
+        state = MP_KEY_STATE_UP;
+        break;
+    case WL_KEYBOARD_KEY_STATE_PRESSED:
+        state = MP_KEY_STATE_DOWN;
+        break;
+    default:
+        return;
+    }
+
+    s->keyboard_code = key + 8;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, s->keyboard_code);
+    int mpkey = lookupkey(sym);
+
+    if (mpkey) {
+        mp_input_put_key(wl->vo->input_ctx, mpkey | state | s->mpmod);
+    } else {
+        char str[128];
+        if (xkb_keysym_to_utf8(sym, str, sizeof(str)) > 0) {
+            mp_input_put_key_utf8(wl->vo->input_ctx, state | s->mpmod, bstr0(str));
+        } else {
+            // Assume a modifier was pressed and handle it in the mod event instead.
+            // If a modifier is released before a regular key, also release that
+            // key to not activate it again by accident.
+            if (state == MP_KEY_STATE_UP) {
+                s->mpkey = 0;
+                mp_input_put_key(wl->vo->input_ctx, MP_INPUT_RELEASE_ALL);
+            }
+            return;
+        }
+    }
+    if (state == MP_KEY_STATE_DOWN)
+        s->mpkey = mpkey;
+    if (mpkey && state == MP_KEY_STATE_UP)
+        s->mpkey = 0;
 }
 
 static void prepare_resize(struct vo_wayland_state *wl)
@@ -2087,7 +2152,7 @@ static int set_screensaver_inhibitor(struct vo_wayland_state *wl, int state)
     if (state) {
         MP_VERBOSE(wl, "Enabling idle inhibitor\n");
         struct zwp_idle_inhibit_manager_v1 *mgr = wl->idle_inhibit_manager;
-        wl->idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(mgr, wl->surface);
+        wl->idle_inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(mgr, wl->callback_surface);
     } else {
         MP_VERBOSE(wl, "Disabling the idle inhibitor\n");
         zwp_idle_inhibitor_v1_destroy(wl->idle_inhibitor);
@@ -2596,6 +2661,13 @@ bool vo_wayland_init(struct vo *vo)
     } else {
         MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
                    wp_fractional_scale_manager_v1_interface.name);
+    }
+#endif
+
+#if HAVE_WAYLAND_PROTOCOLS_1_32
+    if (!wl->cursor_shape_manager) {
+        MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
+                   wp_cursor_shape_manager_v1_interface.name);
     }
 #endif
 

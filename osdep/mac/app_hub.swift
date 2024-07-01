@@ -37,14 +37,13 @@ class AppHub: NSObject {
 #endif
 
     let MPV_PROTOCOL: String = "mpv://"
-    var isApplication: Bool { get { NSApp is Application } }
+    var isApplication: Bool { return NSApp is Application }
     var openEvents: Int = 0
 
     private override init() {
         input = InputHelper()
         log = LogHelper()
         super.init()
-        if isApplication { menu = MenuBar(self) }
 #if HAVE_MACOS_MEDIA_PLAYER
         remote = RemoteCommandCenter(self)
 #endif
@@ -58,6 +57,7 @@ class AppHub: NSObject {
             log.log = mp_log_new(nil, mp_client_get_log(mpv), "app")
             option = OptionHelper(UnsafeMutablePointer(mpv), mp_client_get_global(mpv))
             input.option = option
+            DispatchQueue.main.sync { menu = MenuBar(self) }
         }
 
 #if HAVE_MACOS_MEDIA_PLAYER

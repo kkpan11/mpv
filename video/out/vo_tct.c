@@ -16,7 +16,6 @@
  */
 
 #include <stdio.h>
-#include <unistd.h>
 #include <config.h>
 
 #if HAVE_POSIX
@@ -243,6 +242,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     p->frame = mp_image_alloc(IMGFMT, p->swidth, p->sheight * mul);
     if (!p->frame)
         return -1;
+
+    mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
 
     if (mp_sws_reinit(p->sws) < 0)
         return -1;

@@ -21,12 +21,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <math.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <fcntl.h>
 #include <assert.h>
 
@@ -93,6 +91,11 @@ struct wheel_state {
     double unit_accum;
 };
 
+struct touch_point {
+    int id;
+    int x, y;
+};
+
 struct input_ctx {
     mp_mutex mutex;
     struct mp_log *log;
@@ -116,6 +119,12 @@ struct input_ctx {
 
     int last_doubleclick_key_down;
     double last_doubleclick_time;
+
+    // VO dragging state
+    bool dragging_button_down;
+    int mouse_drag_x, mouse_drag_y;
+    // Raw mouse position before transform
+    int mouse_raw_x, mouse_raw_y;
 
     // Mouse position on the consumer side (as command.c sees it)
     int mouse_x, mouse_y;
@@ -143,6 +152,10 @@ struct input_ctx {
     struct active_section *active_sections;
     int num_active_sections;
 
+    // List currently active touch points
+    struct touch_point *touch_points;
+    int num_touch_points;
+
     unsigned int mouse_event_counter;
 
     struct mp_input_src *sources[MP_MAX_SOURCES];
@@ -157,6 +170,7 @@ struct input_ctx {
 static int parse_config(struct input_ctx *ictx, bool builtin, bstr data,
                         const char *location, const char *restrict_section);
 static void close_input_sources(struct input_ctx *ictx);
+static bool test_mouse(struct input_ctx *ictx, int x, int y, int rej_flags);
 
 #define OPT_BASE_STRUCT struct input_opts
 struct input_opts {
@@ -168,16 +182,19 @@ struct input_opts {
     // Autorepeat config (be aware of mp_input_set_repeat_info())
     int ar_delay;
     int ar_rate;
+    int dragging_deadzone;
     bool use_alt_gr;
     bool use_gamepad;
     bool use_media_keys;
     bool default_bindings;
     bool builtin_bindings;
+    bool builtin_dragging;
     bool enable_mouse_movements;
     bool vo_key_input;
     bool test;
     bool allow_win_drag;
     bool preprocess_wheel;
+    bool touch_emulate_mouse;
 };
 
 const struct m_sub_options input_config = {
@@ -189,6 +206,7 @@ const struct m_sub_options input_config = {
         {"input-cmdlist", OPT_PRINT(mp_print_cmd_list)},
         {"input-default-bindings", OPT_BOOL(default_bindings)},
         {"input-builtin-bindings", OPT_BOOL(builtin_bindings)},
+        {"input-builtin-dragging", OPT_BOOL(builtin_dragging)},
         {"input-test", OPT_BOOL(test)},
         {"input-doubleclick-time", OPT_INT(doubleclick_time),
          M_RANGE(0, 1000)},
@@ -198,6 +216,8 @@ const struct m_sub_options input_config = {
         {"input-vo-keyboard", OPT_BOOL(vo_key_input)},
         {"input-media-keys", OPT_BOOL(use_media_keys)},
         {"input-preprocess-wheel", OPT_BOOL(preprocess_wheel)},
+        {"input-touch-emulate-mouse", OPT_BOOL(touch_emulate_mouse)},
+        {"input-dragging-deadzone", OPT_INT(dragging_deadzone)},
 #if HAVE_SDL2_GAMEPAD
         {"input-gamepad", OPT_BOOL(use_gamepad)},
 #endif
@@ -210,14 +230,17 @@ const struct m_sub_options input_config = {
         .doubleclick_time = 300,
         .ar_delay = 200,
         .ar_rate = 40,
+        .dragging_deadzone = 3,
         .use_alt_gr = true,
         .enable_mouse_movements = true,
         .use_media_keys = true,
         .default_bindings = true,
         .builtin_bindings = true,
+        .builtin_dragging = true,
         .vo_key_input = true,
         .allow_win_drag = true,
         .preprocess_wheel = true,
+        .touch_emulate_mouse = true,
     },
     .change_flags = UPDATE_INPUT,
 };
@@ -397,8 +420,6 @@ static struct cmd_bind *find_bind_for_key_section(struct input_ctx *ictx,
     for (int builtin = 0; builtin < 2; builtin++) {
         if (builtin && !ictx->opts->default_bindings)
             break;
-        if (best)
-            break;
         for (int n = 0; n < bs->num_binds; n++) {
             if (bs->binds[n].is_builtin == (bool)builtin) {
                 struct cmd_bind *b = &bs->binds[n];
@@ -408,7 +429,7 @@ static struct cmd_bind *find_bind_for_key_section(struct input_ctx *ictx,
                     if (b->keys[i] != keys[b->num_keys - 1 - i])
                         goto skip;
                 }
-                if (!best || b->num_keys >= best->num_keys)
+                if (!best || b->num_keys > best->num_keys)
                     best = b;
             skip: ;
             }
@@ -427,7 +448,9 @@ static struct cmd_bind *find_any_bind_for_key(struct input_ctx *ictx,
 
     // First look whether a mouse section is capturing all mouse input
     // exclusively (regardless of the active section stack order).
-    if (use_mouse && MP_KEY_IS_MOUSE_BTN_SINGLE(ictx->last_key_down)) {
+    if (use_mouse && MP_KEY_IS_MOUSE_BTN_SINGLE(ictx->last_key_down) &&
+        !MP_KEY_IS_MOUSE_BTN_DBL(code))
+    {
         struct cmd_bind *bind =
             find_bind_for_key_section(ictx, ictx->mouse_section, code);
         if (bind)
@@ -444,8 +467,12 @@ static struct cmd_bind *find_any_bind_for_key(struct input_ctx *ictx,
                                                                ictx->mouse_vo_x,
                                                                ictx->mouse_vo_y)))
             {
-                if (!best_bind || (best_bind->is_builtin && !bind->is_builtin))
+                if (!best_bind || bind->num_keys > best_bind->num_keys ||
+                    (best_bind->is_builtin && !bind->is_builtin &&
+                     bind->num_keys == best_bind->num_keys))
+                {
                     best_bind = bind;
+                }
             }
         }
         if (s->flags & MP_INPUT_EXCLUSIVE)
@@ -521,12 +548,13 @@ static void update_mouse_section(struct input_ctx *ictx)
 }
 
 // Called when the currently held-down key is released. This (usually) sends
-// the a key-up version of the command associated with the keys that were held
+// the key-up version of the command associated with the keys that were held
 // down.
 // If the drop_current parameter is set to true, then don't send the key-up
 // command. Unless we've already sent a key-down event, in which case the
 // input receiver (the player) must get a key-up event, or it would get stuck
-// thinking a key is still held down.
+// thinking a key is still held down. In this case, mark the command as
+// canceled so that it can be distinguished from a normally triggered command.
 static void release_down_cmd(struct input_ctx *ictx, bool drop_current)
 {
     if (ictx->current_down_cmd && ictx->current_down_cmd->emit_on_up &&
@@ -534,6 +562,8 @@ static void release_down_cmd(struct input_ctx *ictx, bool drop_current)
     {
         memset(ictx->key_history, 0, sizeof(ictx->key_history));
         ictx->current_down_cmd->is_up = true;
+        if (drop_current)
+            ictx->current_down_cmd->canceled = true;
         queue_cmd(ictx, ictx->current_down_cmd);
     } else {
         talloc_free(ictx->current_down_cmd);
@@ -545,7 +575,7 @@ static void release_down_cmd(struct input_ctx *ictx, bool drop_current)
     update_mouse_section(ictx);
 }
 
-// We don't want the append to the command queue indefinitely, because that
+// We don't want it to append to the command queue indefinitely, because that
 // could lead to situations where recovery would take too long.
 static bool should_drop_cmd(struct input_ctx *ictx, struct mp_cmd *cmd)
 {
@@ -608,7 +638,7 @@ static void interpret_key(struct input_ctx *ictx, int code, double scale,
         // Press of key with no separate down/up events
         // Mixing press events and up/down with the same key is not supported,
         // and input sources shouldn't do this, but can happen anyway if
-        // multiple input sources interfere with each others.
+        // multiple input sources interfere with each other.
         if (ictx->last_key_down == code)
             release_down_cmd(ictx, false);
         cmd = resolve_key(ictx, code);
@@ -654,7 +684,7 @@ static bool process_wheel(struct input_ctx *ictx, int code, double *scale,
     // much in any direction before their scroll is registered.
     static const double DEADZONE_DIST = 0.125;
     // The deadzone accumulator is reset if no scrolls happened in this many
-    // seconds, eg. the user is assumed to have finished scrolling.
+    // seconds, e.g. the user is assumed to have finished scrolling.
     static const double DEADZONE_SCROLL_TIME = 0.2;
     // The scale_units accumulator is reset if no scrolls happened in this many
     // seconds. This value should be fairly large, so commands will still be
@@ -721,6 +751,12 @@ static void feed_key(struct input_ctx *ictx, int code, double scale,
     if (code == MP_INPUT_RELEASE_ALL) {
         MP_TRACE(ictx, "release all\n");
         release_down_cmd(ictx, false);
+        ictx->dragging_button_down = false;
+        return;
+    }
+    if (code == MP_TOUCH_RELEASE_ALL) {
+        MP_TRACE(ictx, "release all touch\n");
+        ictx->num_touch_points = 0;
         return;
     }
     if (!opts->enable_mouse_movements && MP_KEY_IS_MOUSE(unmod) && !force_mouse)
@@ -736,7 +772,7 @@ static void feed_key(struct input_ctx *ictx, int code, double scale,
         return;
     }
     double now = mp_time_sec();
-    // ignore system-doubleclick if we generate these events ourselves
+    // ignore system doubleclick if we generate these events ourselves
     if (!force_mouse && opts->doubleclick_time && MP_KEY_IS_MOUSE_BTN_DBL(unmod))
         return;
     int units = 1;
@@ -752,14 +788,26 @@ static void feed_key(struct input_ctx *ictx, int code, double scale,
             now = 0;
             interpret_key(ictx, code - MP_MBTN_BASE + MP_MBTN_DBL_BASE,
                           1, 1);
-        } else if (code == MP_MBTN_LEFT) {
-            // This is a mouse left botton down event which isn't part of a doubleclick.
-            // Initialize vo dragging in this case.
-            mp_cmd_t *cmd = mp_input_parse_cmd(ictx, bstr0("begin-vo-dragging"), "<internal>");
-            queue_cmd(ictx, cmd);
+        } else if (code == MP_MBTN_LEFT && ictx->opts->allow_win_drag &&
+                   !test_mouse(ictx, ictx->mouse_vo_x, ictx->mouse_vo_y, MP_INPUT_ALLOW_VO_DRAGGING))
+        {
+            // This is a mouse left button down event which isn't part of a doubleclick,
+            // and the mouse is on an input section which allows VO dragging.
+            // Mark the dragging mouse button down in this case.
+            ictx->dragging_button_down = true;
+            // Store the current mouse position for deadzone handling.
+            ictx->mouse_drag_x = ictx->mouse_raw_x;
+            ictx->mouse_drag_y = ictx->mouse_raw_y;
         }
         ictx->last_doubleclick_key_down = code;
         ictx->last_doubleclick_time = now;
+    }
+    if (code & MP_KEY_STATE_UP) {
+        code &= ~MP_KEY_STATE_UP;
+        if (code == MP_MBTN_LEFT) {
+            // This is a mouse left botton up event. Mark the dragging mouse button up.
+            ictx->dragging_button_down = false;
+        }
     }
 }
 
@@ -836,9 +884,11 @@ static void set_mouse_pos(struct input_ctx *ictx, int x, int y)
 {
     MP_TRACE(ictx, "mouse move %d/%d\n", x, y);
 
-    if (ictx->mouse_vo_x == x && ictx->mouse_vo_y == y) {
+    if (ictx->mouse_raw_x == x && ictx->mouse_raw_y == y) {
         return;
     }
+    ictx->mouse_raw_x = x;
+    ictx->mouse_raw_y = y;
 
     if (ictx->mouse_mangle) {
         struct mp_rect *src = &ictx->mouse_src;
@@ -877,6 +927,22 @@ static void set_mouse_pos(struct input_ctx *ictx, int x, int y)
             queue_cmd(ictx, cmd);
         }
     }
+
+    bool mouse_outside_dragging_deadzone =
+        abs(ictx->mouse_raw_x - ictx->mouse_drag_x) >= ictx->opts->dragging_deadzone ||
+        abs(ictx->mouse_raw_y - ictx->mouse_drag_y) >= ictx->opts->dragging_deadzone;
+    if (ictx->dragging_button_down && mouse_outside_dragging_deadzone &&
+        ictx->opts->builtin_dragging)
+    {
+        // Begin built-in VO dragging if the mouse moves while the dragging button is down.
+        ictx->dragging_button_down = false;
+        // Prevent activation of MBTN_LEFT key binding if VO dragging begins.
+        release_down_cmd(ictx, true);
+        // Prevent activation of MBTN_LEFT_DBL if VO dragging begins.
+        ictx->last_doubleclick_time = 0;
+        mp_cmd_t *drag_cmd = mp_input_parse_cmd(ictx, bstr0("begin-vo-dragging"), "<internal>");
+        queue_cmd(ictx, drag_cmd);
+    }
 }
 
 void mp_input_set_mouse_pos_artificial(struct input_ctx *ictx, int x, int y)
@@ -892,6 +958,99 @@ void mp_input_set_mouse_pos(struct input_ctx *ictx, int x, int y)
     if (ictx->opts->enable_mouse_movements)
         set_mouse_pos(ictx, x, y);
     input_unlock(ictx);
+}
+
+static int find_touch_point_index(struct input_ctx *ictx, int id)
+{
+    for (int i = 0; i < ictx->num_touch_points; i++) {
+        if (ictx->touch_points[i].id == id)
+            return i;
+    }
+    return -1;
+}
+
+static void notify_touch_update(struct input_ctx *ictx)
+{
+    // queue dummy cmd so that touch-pos can notify observers
+    mp_cmd_t *cmd = mp_input_parse_cmd(ictx, bstr0("ignore"), "<internal>");
+    queue_cmd(ictx, cmd);
+}
+
+static void update_touch_point(struct input_ctx *ictx, int idx, int id, int x, int y)
+{
+    MP_TRACE(ictx, "Touch point %d update (id %d) %d/%d\n",
+             idx, id, x, y);
+    if (ictx->touch_points[idx].x == x && ictx->touch_points[idx].y == y)
+        return;
+    ictx->touch_points[idx].x = x;
+    ictx->touch_points[idx].y = y;
+    // Emulate mouse input from the primary touch point (the first one added)
+    if (ictx->opts->touch_emulate_mouse && idx == 0)
+        set_mouse_pos(ictx, x, y);
+    notify_touch_update(ictx);
+}
+
+void mp_input_add_touch_point(struct input_ctx *ictx, int id, int x, int y)
+{
+    input_lock(ictx);
+    int idx = find_touch_point_index(ictx, id);
+    if (idx != -1) {
+        MP_WARN(ictx, "Touch point %d (id %d) already exists! Treat as update.\n",
+                idx, id);
+        update_touch_point(ictx, idx, id, x, y);
+    } else {
+        MP_TRACE(ictx, "Touch point %d add (id %d) %d/%d\n",
+                 ictx->num_touch_points, id, x, y);
+        MP_TARRAY_APPEND(ictx, ictx->touch_points, ictx->num_touch_points,
+                         (struct touch_point){id, x, y});
+        // Emulate MBTN_LEFT down if this is the only touch point
+        if (ictx->opts->touch_emulate_mouse && ictx->num_touch_points == 1) {
+            set_mouse_pos(ictx, x, y);
+            feed_key(ictx, MP_MBTN_LEFT | MP_KEY_STATE_DOWN, 1, false);
+        }
+        notify_touch_update(ictx);
+    }
+    input_unlock(ictx);
+}
+
+void mp_input_update_touch_point(struct input_ctx *ictx, int id, int x, int y)
+{
+    input_lock(ictx);
+    int idx = find_touch_point_index(ictx, id);
+    if (idx != -1) {
+        update_touch_point(ictx, idx, id, x, y);
+    } else {
+        MP_WARN(ictx, "Touch point id %d does not exist!\n", id);
+    }
+    input_unlock(ictx);
+}
+
+void mp_input_remove_touch_point(struct input_ctx *ictx, int id)
+{
+    input_lock(ictx);
+    int idx = find_touch_point_index(ictx, id);
+    if (idx != -1) {
+        MP_TRACE(ictx, "Touch point %d remove (id %d)\n", idx, id);
+        MP_TARRAY_REMOVE_AT(ictx->touch_points, ictx->num_touch_points, idx);
+        // Emulate MBTN_LEFT up if there are no touch points left
+        if (ictx->opts->touch_emulate_mouse && ictx->num_touch_points == 0)
+            feed_key(ictx, MP_MBTN_LEFT | MP_KEY_STATE_UP, 1, false);
+        notify_touch_update(ictx);
+    }
+    input_unlock(ictx);
+}
+
+int mp_input_get_touch_pos(struct input_ctx *ictx, int count, int *x, int *y, int *id)
+{
+    input_lock(ictx);
+    int num_touch_points = ictx->num_touch_points;
+    for (int i = 0; i < MPMIN(num_touch_points, count); i++) {
+        x[i] = ictx->touch_points[i].x;
+        y[i] = ictx->touch_points[i].y;
+        id[i] = ictx->touch_points[i].id;
+    }
+    input_unlock(ictx);
+    return num_touch_points;
 }
 
 static bool test_mouse(struct input_ctx *ictx, int x, int y, int rej_flags)
@@ -1312,7 +1471,7 @@ static bool parse_config_file(struct input_ctx *ictx, char *file)
     file = mp_get_user_path(tmp, ictx->global, file);
 
     s = stream_create(file, STREAM_ORIGIN_DIRECT | STREAM_READ, NULL, ictx->global);
-    if (!s) {
+    if (!s || s->is_directory) {
         MP_ERR(ictx, "Can't open input config file %s.\n", file);
         goto done;
     }
@@ -1348,6 +1507,7 @@ struct input_ctx *mp_input_init(struct mpv_global *global,
         .wakeup_cb = wakeup_cb,
         .wakeup_ctx = wakeup_ctx,
         .active_sections = talloc_array(ictx, struct active_section, 0),
+        .touch_points = talloc_array(ictx, struct touch_point, 0),
     };
 
     ictx->opts = ictx->opts_cache->opts;

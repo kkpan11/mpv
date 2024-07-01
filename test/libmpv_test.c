@@ -49,12 +49,12 @@ static mpv_handle *ctx;
 MP_NORETURN PRINTF_ATTRIBUTE(1, 2)
 static void fail(const char *fmt, ...)
 {
-	if (fmt) {
-		va_list va;
-		va_start(va, fmt);
-		vfprintf(stderr, fmt, va);
-		va_end(va);
-	}
+    if (fmt) {
+        va_list va;
+        va_start(va, fmt);
+        vfprintf(stderr, fmt, va);
+        va_end(va);
+    }
     exit(1);
 }
 
@@ -71,10 +71,10 @@ static mpv_event *wrap_wait_event(void)
         mpv_event *ev = mpv_wait_event(ctx, 1);
 
         if (ev->event_id == MPV_EVENT_NONE) {
-			continue;
+            continue;
         } else if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
             mpv_event_log_message *msg = (mpv_event_log_message*)ev->data;
-			printf("[%s:%s] %s", msg->prefix, msg->level, msg->text);
+            printf("[%s:%s] %s", msg->prefix, msg->level, msg->text);
             if (msg->log_level <= MPV_LOG_LEVEL_ERROR)
                 fail("error was logged");
         } else {
