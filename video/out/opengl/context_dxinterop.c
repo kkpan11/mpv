@@ -30,11 +30,6 @@
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
 
-// mingw-w64 header typo?
-#ifndef IDirect3DSwapChain9Ex_GetBackBuffer
-#define IDirect3DSwapChain9Ex_GetBackBuffer IDirect3DSwapChain9EX_GetBackBuffer
-#endif
-
 struct priv {
     GL gl;
 
@@ -344,9 +339,8 @@ static void fill_presentparams(struct ra_ctx *ctx,
         .Windowed = TRUE,
         .BackBufferWidth = ctx->vo->dwidth ? ctx->vo->dwidth : 1,
         .BackBufferHeight = ctx->vo->dheight ? ctx->vo->dheight : 1,
-        // Add one frame for the backbuffer and one frame of "slack" to reduce
-        // contention with the window manager when acquiring the backbuffer
-        .BackBufferCount = ctx->vo->opts->swapchain_depth + 2,
+        // Add one frame for the backbuffer
+        .BackBufferCount = ctx->vo->opts->swapchain_depth + 1,
         .SwapEffect = IsWindows7OrGreater() ? D3DSWAPEFFECT_FLIPEX : D3DSWAPEFFECT_FLIP,
         // Automatically get the backbuffer format from the display format
         .BackBufferFormat = D3DFMT_UNKNOWN,
@@ -552,10 +546,8 @@ static bool dxgl_init(struct ra_ctx *ctx)
     if (d3d_size_dependent_create(ctx) < 0)
         goto fail;
 
-    static const struct ra_swapchain_fns empty_swapchain_fns = {0};
-    struct ra_gl_ctx_params params = {
+    struct ra_ctx_params params = {
         .swap_buffers = dxgl_swap_buffers,
-        .external_swapchain = &empty_swapchain_fns,
     };
 
     gl->flipped = true;

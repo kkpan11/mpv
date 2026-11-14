@@ -447,7 +447,7 @@ static int thread_control(struct ao *ao, enum aocontrol cmd, void *arg)
         MP_WARN(ao, "Error setting audio session name: %s\n",
                 mp_HRESULT_to_str(hr));
 
-        assert(ao->client_name);
+        mp_assert(ao->client_name);
         if (!ao->client_name)
             return CONTROL_ERROR;
 
@@ -502,8 +502,10 @@ static bool audio_set_pause(struct ao *ao, bool paused)
 static void hotplug_uninit(struct ao *ao)
 {
     MP_DBG(ao, "Hotplug uninit\n");
+    struct wasapi_state *state = ao->priv;
     wasapi_change_uninit(ao);
-    CoUninitialize();
+    if (state->hotplug_mta)
+        CoDecrementMTAUsage(state->hotplug_mta);
 }
 
 static int hotplug_init(struct ao *ao)
@@ -511,8 +513,9 @@ static int hotplug_init(struct ao *ao)
     MP_DBG(ao, "Hotplug init\n");
     struct wasapi_state *state = ao->priv;
     state->log = ao->log;
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    HRESULT hr = wasapi_change_init(ao, true);
+    HRESULT hr = CoIncrementMTAUsage(&state->hotplug_mta);
+    EXIT_ON_ERROR(hr);
+    hr = wasapi_change_init(ao, true);
     EXIT_ON_ERROR(hr);
 
     return 0;

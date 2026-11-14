@@ -153,25 +153,34 @@ static int init(struct ra_hwdec *hw)
     else
         hw->glsl_extensions = es2_exts;
 
+    // This sets the upper bound for AImages we can acquire from this reader
+    // (incl. ones currently queued) at the same time.
+    // The documentation recommends a margin of 2 for acquireLatestImage to
+    // work correctly.
+    const int max_images = 3;
     // dummy dimensions, AImageReader only transports hardware buffers
     media_status_t ret = p->AImageReader_newWithUsage(16, 16,
         AIMAGE_FORMAT_PRIVATE, AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE,
-        5, &p->reader);
+        max_images, &p->reader);
     if (ret != AMEDIA_OK) {
         MP_ERR(hw, "newWithUsage failed: %d\n", ret);
         return -1;
     }
-    assert(p->reader);
+    mp_assert(p->reader);
 
-    ANativeWindow *window;
+    ANativeWindow *window = NULL;
     ret = p->AImageReader_getWindow(p->reader, &window);
     if (ret != AMEDIA_OK) {
         MP_ERR(hw, "getWindow failed: %d\n", ret);
         return -1;
     }
-    assert(window);
+    mp_assert(window);
 
     jobject surface = p->ANativeWindow_toSurface(env, window);
+    if (!surface) {
+        MP_ERR(hw, "toSurface returned null\n");
+        return -1;
+    }
     p->surface = (*env)->NewGlobalRef(env, surface);
     (*env)->DeleteLocalRef(env, surface);
 
@@ -197,7 +206,7 @@ static void uninit(struct ra_hwdec *hw)
 
     if (p->surface) {
         JNIEnv *env = MP_JNI_GET_ENV(hw);
-        assert(env);
+        mp_assert(env);
         (*env)->DeleteGlobalRef(env, p->surface);
         p->surface = NULL;
     }
@@ -326,40 +335,53 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     struct priv_owner *o = mapper->owner->priv;
     GL *gl = ra_gl_get(mapper->ra);
 
+    mp_mutex_lock(&p->lock);
+    p->image_available = false;
+    mp_mutex_unlock(&p->lock);
+
     {
         if (mapper->src->imgfmt != IMGFMT_MEDIACODEC)
             return -1;
         AVMediaCodecBuffer *buffer = (AVMediaCodecBuffer *)mapper->src->planes[3];
-        av_mediacodec_release_buffer(buffer, 1);
+        int err = av_mediacodec_release_buffer(buffer, 1);
+        if (err != 0) {
+            char errstr[80];
+            av_strerror(err, errstr, sizeof(errstr));
+            MP_ERR(p, "Failed to render buffer: %s\n", errstr);
+            // HACK: If the buffer has been released already, return fake
+            // success to avoid flashing frames of render errors.
+            // The VOs need to be fixed to handle this gracefully.
+            return err == AVERROR(ENOENT) ? 0 : -1;
+        }
     }
 
     bool image_available = false;
     mp_mutex_lock(&p->lock);
     if (!p->image_available) {
         mp_cond_timedwait(&p->cond, &p->lock, MP_TIME_MS_TO_NS(100));
-        if (!p->image_available)
-            MP_WARN(mapper, "Waiting for frame timed out!\n");
     }
     image_available = p->image_available;
-    p->image_available = false;
     mp_mutex_unlock(&p->lock);
+    if (!image_available)
+        MP_WARN(p, "Waiting for frame timed out!\n");
 
+    // Note that this will clear all queued images and only return the latest one
     media_status_t ret = o->AImageReader_acquireLatestImage(o->reader, &p->image);
     if (ret != AMEDIA_OK) {
-        MP_ERR(mapper, "acquireLatestImage failed: %d\n", ret);
-        // If we merely timed out waiting return success anyway to avoid
-        // flashing frames of render errors.
-        return image_available ? -1 : 0;
+        MP_ERR(p, "acquireLatestImage failed: %d\n", ret);
+        // (same hack as above)
+        return (ret == AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE && !image_available)
+            ? 0 : -1;
     }
-    assert(p->image);
+    mp_assert(p->image);
 
     AHardwareBuffer *hwbuf = NULL;
     ret = o->AImage_getHardwareBuffer(p->image, &hwbuf);
     if (ret != AMEDIA_OK) {
-        MP_ERR(mapper, "getHardwareBuffer failed: %d\n", ret);
+        MP_ERR(p, "getHardwareBuffer failed: %d\n", ret);
         return -1;
     }
-    assert(hwbuf);
+    mp_assert(hwbuf);
 
     // Update texture size since it may differ
     AHardwareBuffer_Desc d;
@@ -392,6 +414,7 @@ const struct ra_hwdec_driver ra_hwdec_aimagereader = {
     .name = "aimagereader",
     .priv_size = sizeof(struct priv_owner),
     .imgfmts = {IMGFMT_MEDIACODEC, 0},
+    .device_type = AV_HWDEVICE_TYPE_MEDIACODEC,
     .init = init,
     .uninit = uninit,
     .mapper = &(const struct ra_hwdec_mapper_driver){

@@ -24,51 +24,45 @@ extension NSDeviceDescriptionKey {
 
 extension NSScreen {
     public var displayID: CGDirectDisplayID {
-        get {
-            return deviceDescription[.screenNumber] as? CGDirectDisplayID ?? 0
-        }
+        return deviceDescription[.screenNumber] as? CGDirectDisplayID ?? 0
     }
 
     public var serialNumber: String {
-        get {
-            return String(CGDisplaySerialNumber(displayID))
-        }
+        return String(CGDisplaySerialNumber(displayID))
     }
 
     public var name: String {
-        get {
-            // force unwrapping is fine here, regex is guaranteed to be valid
-            let regex = try! NSRegularExpression(pattern: " \\(\\d+\\)$", options: .caseInsensitive)
-            return regex.stringByReplacingMatches(
-                in: localizedName,
-                range: NSRange(location: 0, length: localizedName.count),
-                withTemplate: ""
-            )
+        guard let regex = try? NSRegularExpression(pattern: " \\(\\d+\\)$", options: .caseInsensitive) else {
+            return localizedName
         }
+        return regex.stringByReplacingMatches(
+            in: localizedName,
+            range: NSRange(location: 0, length: localizedName.count),
+            withTemplate: ""
+        )
     }
 
     public var uniqueName: String {
-        get {
-            return name + " (\(serialNumber))"
-        }
-    }
-}
-
-extension NSColor {
-    convenience init(hex: String) {
-        let int = Int(hex.dropFirst(), radix: 16) ?? 0
-        let alpha = CGFloat((int >> 24) & 0x000000FF)/255
-        let red   = CGFloat((int >> 16) & 0x000000FF)/255
-        let green = CGFloat((int >> 8)  & 0x000000FF)/255
-        let blue  = CGFloat((int)       & 0x000000FF)/255
-
-        self.init(calibratedRed: red, green: green, blue: blue, alpha: alpha)
+        return name + " (\(serialNumber))"
     }
 }
 
 extension NSEvent.ModifierFlags {
-    public static var optionLeft: NSEvent.ModifierFlags = .init(rawValue: UInt(NX_DEVICELALTKEYMASK))
-    public static var optionRight: NSEvent.ModifierFlags = .init(rawValue: UInt(NX_DEVICERALTKEYMASK))
+    public static let optionLeft: NSEvent.ModifierFlags = .init(rawValue: UInt(NX_DEVICELALTKEYMASK))
+    public static let optionRight: NSEvent.ModifierFlags = .init(rawValue: UInt(NX_DEVICERALTKEYMASK))
+}
+
+extension String {
+    func isUrl() -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: "^(https?|ftp)://[^\\s/$.?#].[^\\s]*$",
+                                                   options: .caseInsensitive) else {
+            return false
+        }
+        let isUrl = regex.numberOfMatches(in: self,
+                                     options: [],
+                                       range: NSRange(location: 0, length: self.count))
+        return isUrl > 0
+    }
 }
 
 extension mp_keymap {
@@ -80,7 +74,7 @@ extension mp_keymap {
 extension mpv_event_id: CustomStringConvertible {
     public var description: String {
         switch self {
-        case MPV_EVENT_NONE: return "MPV_EVENT_NONE2"
+        case MPV_EVENT_NONE: return "MPV_EVENT_NONE"
         case MPV_EVENT_SHUTDOWN: return "MPV_EVENT_SHUTDOWN"
         case MPV_EVENT_LOG_MESSAGE: return "MPV_EVENT_LOG_MESSAGE"
         case MPV_EVENT_GET_PROPERTY_REPLY: return "MPV_EVENT_GET_PROPERTY_REPLY"
@@ -113,5 +107,46 @@ extension Bool {
 extension Int32 {
     init(_ bool: Bool) {
         self.init(bool ? 1 : 0)
+    }
+}
+
+extension MTLPixelFormat {
+    public var name: String {
+        switch self {
+        case .bgra8Unorm: return "bgra8Unorm"
+        case .bgra8Unorm_srgb: return "bgra8Unorm_srgb"
+        case .rgba16Float: return "rgba16Float"
+        case .rgb10a2Unorm: return "rgb10a2Unorm"
+        case .bgr10a2Unorm: return "bgr10a2Unorm"
+        default: break
+        }
+
+#if HAVE_MACOS_11_FEATURES
+        if #available(macOS 11.0, *) {
+            switch self {
+            case .bgra10_xr: return "bgra10_xr"
+            case .bgra10_xr_srgb: return "bgra10_xr_srgb"
+            case .bgr10_xr: return "bgr10_xr"
+            case .bgr10_xr_srgb: return "bgr10_xr_srgb"
+            default: break
+            }
+        }
+#endif
+
+        return "raw pixel format " + String(self.rawValue)
+    }
+}
+
+extension CGColorSpace {
+    public var longName: String {
+        let description = String(describing: self)
+        guard let colorSpaceName = self.name as? String,
+              let regex = try? NSRegularExpression(pattern: ".*\\((.*)\\)", options: .caseInsensitive),
+              let result = regex.firstMatch(in: description, options: [], range: NSRange(location: 0, length: description.count)),
+              let range = Range(result.range(at: 1), in: description) else { return description }
+
+        let nameList = description[range].components(separatedBy: "; ").filter { !$0.hasPrefix("kCGColorSpace") }
+        let simpleName = colorSpaceName.replacingOccurrences(of: "kCGColorSpace", with: "")
+        return "\(simpleName) (\(nameList.joined(separator: ", ")))"
     }
 }

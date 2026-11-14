@@ -27,11 +27,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <limits.h>
-#include <unistd.h>
 
 #include "mpv_talloc.h"
 
 #include "config.h"
+#include "common/common.h"
 #include "misc/random.h"
 #include "osdep/io.h"
 #include "osdep/terminal.h"
@@ -62,15 +62,77 @@ bool mp_set_cloexec(int fd)
     return true;
 }
 
-#ifdef __MINGW32__
-int mp_make_cloexec_pipe(int pipes[2])
+// fopen that sets cloexec.
+FILE *mp_fopen(const char *filename, const char *mode)
 {
-    pipes[0] = pipes[1] = -1;
-    return -1;
+    if (!mode[0]) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    int rwmode;
+    int oflags = 0;
+    switch (mode[0]) {
+    case 'r':
+        rwmode = O_RDONLY;
+        break;
+    case 'w':
+        rwmode = O_WRONLY;
+        oflags |= O_CREAT | O_TRUNC;
+        break;
+    case 'a':
+        rwmode = O_WRONLY;
+        oflags |= O_CREAT | O_APPEND;
+        break;
+    default:
+        errno = EINVAL;
+        return NULL;
+    }
+
+    // Parse extra mode flags
+    for (const char *pos = mode + 1; *pos; pos++) {
+        switch (*pos) {
+        case '+': rwmode = O_RDWR;  break;
+        case 'x': oflags |= O_EXCL; break;
+        // Ignore unknown flags (glibc does too)
+        default: break;
+        }
+    }
+
+    // Open a CRT file descriptor
+    int fd = open(filename, rwmode | oflags | O_CLOEXEC, 0666);
+    if (fd < 0)
+        return NULL;
+
+    // Add 'b' to the mode so the CRT knows the file is opened in binary mode
+    char bmode[] = { mode[0], '\0', '\0', '\0' };
+    int idx = 1;
+    if (rwmode == O_RDWR)
+        bmode[idx++] = '+';
+    bmode[idx++] = 'b';
+    FILE *fp = fdopen(fd, bmode);
+    if (!fp) {
+        close(fd);
+        return NULL;
+    }
+
+    return fp;
 }
-#else
+
+#ifndef _WIN32
+int mp_dup_cloexec(int fd)
+{
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
 int mp_make_cloexec_pipe(int pipes[2])
 {
+#if HAVE_PIPE2
+    if (pipe2(pipes, O_CLOEXEC) != 0) {
+        pipes[0] = pipes[1] = -1;
+        return -1;
+    }
+#else
     if (pipe(pipes) != 0) {
         pipes[0] = pipes[1] = -1;
         return -1;
@@ -78,16 +140,10 @@ int mp_make_cloexec_pipe(int pipes[2])
 
     for (int i = 0; i < 2; i++)
         mp_set_cloexec(pipes[i]);
+#endif
     return 0;
 }
-#endif
 
-#ifdef __MINGW32__
-int mp_make_wakeup_pipe(int pipes[2])
-{
-    return mp_make_cloexec_pipe(pipes);
-}
-#else
 // create a pipe, and set it to non-blocking (and also set FD_CLOEXEC)
 int mp_make_wakeup_pipe(int pipes[2])
 {
@@ -100,15 +156,44 @@ int mp_make_wakeup_pipe(int pipes[2])
     }
     return 0;
 }
-#endif
 
 void mp_flush_wakeup_pipe(int pipe_end)
 {
-#ifndef __MINGW32__
     char buf[100];
     (void)read(pipe_end, buf, sizeof(buf));
-#endif
 }
+#endif
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && !defined(_WIN32)
+// Fuzzed commands and options make mpv write files anywhere. Fuzzing builds
+// write to anonymous memory and only pretend to change the file system.
+int mp_open(const char *filename, int oflag, ...)
+{
+    if (oflag & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC))
+        return memfd_create("mpv", oflag & O_CLOEXEC ? MFD_CLOEXEC : 0);
+    return (open)(filename, oflag);
+}
+
+int mp_mkdir(const char *path, mode_t mode)
+{
+    return 0;
+}
+
+int mp_unlink(const char *path)
+{
+    return 0;
+}
+
+int mp_rename(const char *oldpath, const char *newpath)
+{
+    return 0;
+}
+
+int mp_utime(const char *path, const struct utimbuf *times)
+{
+    return 0;
+}
+#endif
 
 #ifdef _WIN32
 
@@ -116,6 +201,8 @@ void mp_flush_wakeup_pipe(int pipe_end)
 #include <wchar.h>
 #include <stdio.h>
 #include <stddef.h>
+
+#include "osdep/windows_utils.h"
 
 //copied and modified from libav
 //http://git.libav.org/?p=libav.git;a=blob;f=libavformat/os_support.c;h=a0fcd6c9ba2be4b0dbcc476f6c53587345cc1152;hb=HEADl30
@@ -127,6 +214,8 @@ wchar_t *mp_from_utf8(void *talloc_ctx, const char *s)
         abort();
     wchar_t *ret = talloc_array(talloc_ctx, wchar_t, count);
     MultiByteToWideChar(CP_UTF8, 0, s, -1, ret, count);
+    if (count <= 0)
+        abort();
     return ret;
 }
 
@@ -137,26 +226,39 @@ char *mp_to_utf8(void *talloc_ctx, const wchar_t *s)
         abort();
     char *ret = talloc_array(talloc_ctx, char, count);
     WideCharToMultiByte(CP_UTF8, 0, s, -1, ret, count, NULL, NULL);
+    if (count <= 0)
+        abort();
     return ret;
 }
 
 #endif // _WIN32
 
-#ifdef __MINGW32__
+#ifdef _WIN32
+
+#include <stdatomic.h>
 
 #include <io.h>
 #include <fcntl.h>
+
 #include "osdep/threads.h"
+#include "osdep/getpid.h"
 
 static void set_errno_from_lasterror(void)
 {
     // This just handles the error codes expected from CreateFile at the moment
     switch (GetLastError()) {
     case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+    case ERROR_INVALID_DRIVE:
+    case ERROR_BAD_NETPATH:
+    case ERROR_BAD_NET_NAME:
+    case ERROR_BAD_PATHNAME:
+    case ERROR_FILENAME_EXCED_RANGE:
         errno = ENOENT;
         break;
     case ERROR_SHARING_VIOLATION:
     case ERROR_ACCESS_DENIED:
+    case ERROR_NETWORK_ACCESS_DENIED:
         errno = EACCES;
         break;
     case ERROR_FILE_EXISTS:
@@ -268,6 +370,24 @@ static int hstat(HANDLE h, struct mp_stat *buf)
     return 0;
 }
 
+int mp_dup_cloexec(int fd)
+{
+    HANDLE proc = GetCurrentProcess();
+    HANDLE src = (HANDLE)_get_osfhandle(fd), dup = INVALID_HANDLE_VALUE;
+    if (src == INVALID_HANDLE_VALUE)
+        return -1;
+    BOOL ok = DuplicateHandle(proc, src, proc, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    if (!ok) {
+        set_errno_from_lasterror();
+        return -1;
+    }
+    int oflag = _O_RDWR | _O_NOINHERIT; // FIXME: find out the proper flags from the HANDLE
+    int dupfd = _open_osfhandle((intptr_t)dup, oflag);
+    if (dupfd < 0)
+        CloseHandle(dup);
+    return dupfd;
+}
+
 int mp_stat(const char *path, struct mp_stat *buf)
 {
     wchar_t *wpath = mp_from_utf8(NULL, path);
@@ -289,10 +409,8 @@ int mp_stat(const char *path, struct mp_stat *buf)
 int mp_fstat(int fd, struct mp_stat *buf)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
-    if (h == INVALID_HANDLE_VALUE) {
-        errno = EBADF;
+    if (h == INVALID_HANDLE_VALUE)
         return -1;
-    }
     // Use mpv's hstat() function rather than MSVCRT's fstat() because mpv's
     // supports directories and device/inode numbers.
     return hstat(h, buf);
@@ -317,14 +435,8 @@ size_t mp_fwrite(const void *restrict buffer, size_t size, size_t count,
 
     HANDLE wstream = get_handle(stream);
     if (mp_check_console(wstream)) {
-        unsigned char *start = (unsigned char *)buffer;
-        size_t c = 0;
-        for (; c < count; ++c) {
-            if (mp_console_write(wstream, (bstr){start, size}) <= 0)
-                break;
-            start += size;
-        }
-        return c;
+        bstr data = {(unsigned char *)buffer, size * count};
+        return mp_console_write(wstream, data) <= 0 ? 0 : count;
     }
 
 #undef fwrite
@@ -332,12 +444,14 @@ size_t mp_fwrite(const void *restrict buffer, size_t size, size_t count,
 }
 
 #if HAVE_UWP
+MP_PRINTF_ATTRIBUTE(2, 0)
 static int mp_vfprintf(FILE *stream, const char *format, va_list args)
 {
     return vfprintf(stream, format, args);
 }
 #else
 
+MP_PRINTF_ATTRIBUTE(2, 0)
 static int mp_vfprintf(FILE *stream, const char *format, va_list args)
 {
     HANDLE wstream = get_handle(stream);
@@ -376,8 +490,9 @@ int mp_open(const char *filename, int oflag, ...)
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     // Setting FILE_APPEND_DATA and avoiding GENERIC_WRITE/FILE_WRITE_DATA
     // will make the file handle use atomic append behavior
+    // However to implement ftruncate we need FILE_WRITE_DATA
     static const DWORD append =
-        FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA;
+        FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | FILE_WRITE_DATA;
 
     DWORD access = 0;
     DWORD disposition = 0;
@@ -487,58 +602,6 @@ int mp_rename(const char *oldpath, const char *newpath)
         return -1;
     }
     return 0;
-}
-
-FILE *mp_fopen(const char *filename, const char *mode)
-{
-    if (!mode[0]) {
-        errno = EINVAL;
-        return NULL;
-    }
-
-    int rwmode;
-    int oflags = 0;
-    switch (mode[0]) {
-    case 'r':
-        rwmode = _O_RDONLY;
-        break;
-    case 'w':
-        rwmode = _O_WRONLY;
-        oflags |= _O_CREAT | _O_TRUNC;
-        break;
-    case 'a':
-        rwmode = _O_WRONLY;
-        oflags |= _O_CREAT | _O_APPEND;
-        break;
-    default:
-        errno = EINVAL;
-        return NULL;
-    }
-
-    // Parse extra mode flags
-    for (const char *pos = mode + 1; *pos; pos++) {
-        switch (*pos) {
-        case '+': rwmode = _O_RDWR;  break;
-        case 'x': oflags |= _O_EXCL; break;
-        // Ignore unknown flags (glibc does too)
-        default: break;
-        }
-    }
-
-    // Open a CRT file descriptor
-    int fd = mp_open(filename, rwmode | oflags);
-    if (fd < 0)
-        return NULL;
-
-    // Add 'b' to the mode so the CRT knows the file is opened in binary mode
-    char bmode[] = { mode[0], 'b', rwmode == _O_RDWR ? '+' : '\0', '\0' };
-    FILE *fp = fdopen(fd, bmode);
-    if (!fp) {
-        close(fd);
-        return NULL;
-    }
-
-    return fp;
 }
 
 // Windows' MAX_PATH/PATH_MAX/FILENAME_MAX is fixed to 260, but this limit
@@ -664,11 +727,12 @@ static void free_env(void)
 static void init_getenv(void)
 {
 #if !HAVE_UWP
-    wchar_t *wenv = GetEnvironmentStringsW();
-    if (!wenv)
+    wchar_t *wenv_begin = GetEnvironmentStringsW();
+    if (!wenv_begin)
         return;
     utf8_environ_ctx = talloc_new(NULL);
     int num_env = 0;
+    wchar_t *wenv = wenv_begin;
     while (1) {
         size_t len = wcslen(wenv);
         if (!len)
@@ -677,6 +741,7 @@ static void init_getenv(void)
         MP_TARRAY_APPEND(utf8_environ_ctx, utf8_environ, num_env, s);
         wenv += len + 1;
     }
+    FreeEnvironmentStringsW(wenv_begin);
     MP_TARRAY_APPEND(utf8_environ_ctx, utf8_environ, num_env, NULL);
     // Avoid showing up in leak detectors etc.
     atexit(free_env);
@@ -692,7 +757,7 @@ char *mp_getenv(const char *name)
     int i;
     size_t l = strlen(name);
     if (!utf8_environ || !*name || strchr(name, '=')) return NULL;
-    for (i=0; utf8_environ[i] && (strncmp(name, utf8_environ[i], l)
+    for (i=0; utf8_environ[i] && (strncasecmp(name, utf8_environ[i], l)
             || utf8_environ[i][l] != '='); i++) {}
     if (utf8_environ[i]) return utf8_environ[i] + l+1;
     return NULL;
@@ -704,7 +769,7 @@ char ***mp_penviron(void)
     return &utf8_environ;  // `environ' should be an l-value
 }
 
-off_t mp_lseek(int fd, off_t offset, int whence)
+off_t mp_lseek64(int fd, off_t offset, int whence)
 {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_DISK) {
@@ -714,41 +779,36 @@ off_t mp_lseek(int fd, off_t offset, int whence)
     return _lseeki64(fd, offset, whence);
 }
 
-_Thread_local
+int mp_ftruncate64(int fd, off_t length)
+{
+    if (_chsize_s(fd, length) == 0)
+        return 0;
+    return -1;
+}
+
+thread_local
 static struct {
     DWORD errcode;
-    char *errstring;
-} mp_dl_result = {
-    .errcode = 0,
-    .errstring = NULL
-};
-
-static void mp_dl_free(void)
-{
-    if (mp_dl_result.errstring != NULL) {
-        talloc_free(mp_dl_result.errstring);
-    }
-}
-
-static void mp_dl_init(void)
-{
-    atexit(mp_dl_free);
-}
+    char errstring[1024];
+} mp_dl_result;
 
 void *mp_dlopen(const char *filename, int flag)
 {
     HMODULE lib = NULL;
     void *ta_ctx = talloc_new(NULL);
     wchar_t *wfilename = mp_from_utf8(ta_ctx, filename);
+    wchar_t *path = wfilename;
 
-    DWORD len = GetFullPathNameW(wfilename, 0, NULL, NULL);
-    if (!len)
-        goto err;
+    if (strchr(filename, '/') || strchr(filename, '\\')) {
+        DWORD len = GetFullPathNameW(wfilename, 0, NULL, NULL);
+        if (!len)
+            goto err;
 
-    wchar_t *path = talloc_array(ta_ctx, wchar_t, len);
-    len = GetFullPathNameW(wfilename, len, path, NULL);
-    if (!len)
-        goto err;
+        path = talloc_array(ta_ctx, wchar_t, len);
+        len = GetFullPathNameW(wfilename, len, path, NULL);
+        if (!len)
+            goto err;
+    }
 
     lib = LoadLibraryW(path);
 
@@ -767,33 +827,14 @@ void *mp_dlsym(void *handle, const char *symbol)
 
 char *mp_dlerror(void)
 {
-    static mp_once once_init_dlerror = MP_STATIC_ONCE_INITIALIZER;
-    mp_exec_once(&once_init_dlerror, mp_dl_init);
-    mp_dl_free();
-
     if (mp_dl_result.errcode == 0)
         return NULL;
 
-    // convert error code to a string message
-    LPWSTR werrstring = NULL;
-    FormatMessageW(
-        FORMAT_MESSAGE_FROM_SYSTEM
-            | FORMAT_MESSAGE_IGNORE_INSERTS
-            | FORMAT_MESSAGE_ALLOCATE_BUFFER,
-        NULL,
-        mp_dl_result.errcode,
-        MAKELANGID(LANG_NEUTRAL, SUBLANG_NEUTRAL),
-        (LPWSTR) &werrstring,
-        0,
-        NULL);
+    mp_HRESULT_to_str_buf(mp_dl_result.errstring, sizeof(mp_dl_result.errstring),
+                          mp_dl_result.errcode);
     mp_dl_result.errcode = 0;
 
-    if (werrstring) {
-        mp_dl_result.errstring = mp_to_utf8(NULL, werrstring);
-        LocalFree(werrstring);
-    }
-
-    return mp_dl_result.errstring == NULL
+    return !mp_dl_result.errstring[0]
         ? "unknown error"
         : mp_dl_result.errstring;
 }
@@ -822,14 +863,12 @@ int msync(void *addr, size_t length, int flags)
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
-    assert(addr == NULL); // not implemented
-    assert(flags == MAP_SHARED); // not implemented
+    mp_assert(addr == NULL); // not implemented
+    mp_assert(flags == MAP_SHARED); // not implemented
 
     HANDLE osf = (HANDLE)_get_osfhandle(fd);
-    if (!osf) {
-        errno = EBADF;
+    if (osf == INVALID_HANDLE_VALUE)
         return MAP_FAILED;
-    }
 
     DWORD protect = 0;
     DWORD access = 0;
@@ -888,6 +927,95 @@ locale_t uselocale(locale_t locobj)
 
 void freelocale(locale_t locobj)
 {
+}
+
+#define MP_PIPE_BUF_SIZE 65536
+
+int mp_make_cloexec_pipe(int pipes[2])
+{
+    if (_pipe(pipes, MP_PIPE_BUF_SIZE, _O_BINARY | _O_NOINHERIT) != 0) {
+        pipes[0] = pipes[1] = -1;
+        return -1;
+    }
+    return 0;
+}
+
+int mp_make_wakeup_pipe(int pipes[2])
+{
+    static atomic_ulong pipe_id = 0;
+
+    pipes[0] = pipes[1] = -1;
+    HANDLE handles[2];
+    handles[0] = handles[1] = INVALID_HANDLE_VALUE;
+
+    const char *pipe_name = mp_tprintf(55, "\\\\?\\pipe\\mpv\\%lu-%lu", mp_getpid(), atomic_fetch_add_explicit(&pipe_id, 1, memory_order_relaxed));
+
+    handles[1] = CreateNamedPipeA(
+        pipe_name,
+        PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+        0,
+        1,
+        MP_PIPE_BUF_SIZE,
+        MP_PIPE_BUF_SIZE,
+        0,
+        NULL
+    );
+    if (handles[1] == INVALID_HANDLE_VALUE) {
+        set_errno_from_lasterror();
+        goto error;
+    }
+
+    handles[0] = CreateFileA(
+        pipe_name,
+        GENERIC_READ,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        NULL
+    );
+    if (handles[0] == INVALID_HANDLE_VALUE) {
+        set_errno_from_lasterror();
+        goto error;
+    }
+
+    if (!ConnectNamedPipe(handles[1], NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+        set_errno_from_lasterror();
+        goto error;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        pipes[i] = _open_osfhandle((intptr_t)handles[i], 0);
+        if (pipes[i] == -1)
+            goto error;
+    }
+
+    return 0;
+
+error:
+    for (int i = 0; i < 2; i++) {
+        if (pipes[i] != -1) {
+            _close(pipes[i]);
+            pipes[i] = -1;
+        } else if (handles[i] != INVALID_HANDLE_VALUE) {
+            CloseHandle(handles[i]);
+        }
+    }
+
+    return -1;
+}
+
+void mp_flush_wakeup_pipe(int pipe_end)
+{
+    char buf[100];
+    OVERLAPPED operation = {};
+    HANDLE handle = (HANDLE)_get_osfhandle(pipe_end);
+    if (handle == INVALID_HANDLE_VALUE)
+        return;
+    if (!ReadFile(handle, buf, sizeof(buf), NULL, &operation)) {
+        if (GetLastError() != ERROR_IO_PENDING || !CancelIoEx(handle, &operation))
+            set_errno_from_lasterror();
+    }
 }
 
 #endif // __MINGW32__

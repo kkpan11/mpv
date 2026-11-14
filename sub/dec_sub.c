@@ -23,6 +23,7 @@
 #include <limits.h>
 
 #include "demux/demux.h"
+#include "demux/packet_pool.h"
 #include "sd.h"
 #include "dec_sub.h"
 #include "options/m_config.h"
@@ -35,9 +36,15 @@
 
 extern const struct sd_functions sd_ass;
 extern const struct sd_functions sd_lavc;
+#if HAVE_SUBRANDR
+extern const struct sd_functions sd_sbr;
+#endif
 
 static const struct sd_functions *const sd_list[] = {
     &sd_lavc,
+#if HAVE_SUBRANDR
+    &sd_sbr,
+#endif
     &sd_ass,
     NULL
 };
@@ -47,6 +54,7 @@ struct dec_sub {
 
     struct mp_log *log;
     struct mpv_global *global;
+    struct demux_packet_pool *packet_pool;
     struct mp_subtitle_opts *opts;
     struct mp_subtitle_shared_opts *shared_opts;
     struct m_config_cache *opts_cache;
@@ -67,6 +75,7 @@ struct dec_sub {
 
     struct mp_codec_params *codec;
     double start, end;
+    char *lang;
 
     double last_vo_pts;
     struct sd *sd;
@@ -98,7 +107,7 @@ static void update_subtitle_speed(struct dec_sub *sub)
 static double pts_to_subtitle(struct dec_sub *sub, double pts)
 {
     struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    float delay = sub->order < 0 ? 0.0f : opts->sub_delay[sub->order];
+    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->play_dir - delay) / sub->sub_speed;
@@ -109,7 +118,7 @@ static double pts_to_subtitle(struct dec_sub *sub, double pts)
 static double pts_from_subtitle(struct dec_sub *sub, double pts)
 {
     struct mp_subtitle_shared_opts *opts = sub->shared_opts;
-    float delay = sub->order < 0 ? 0.0f : opts->sub_delay[sub->order];
+    double delay = sub->order < 0 ? 0.0 : opts->sub_delay[sub->order];
 
     if (pts != MP_NOPTS_VALUE)
         pts = (pts * sub->sub_speed + delay) * sub->play_dir;
@@ -127,7 +136,8 @@ static void destroy_cached_pkts(struct dec_sub *sub)
 {
     int index = 0;
     while (index < sub->num_cached_pkts) {
-        TA_FREEP(&sub->cached_pkts[index]);
+        demux_packet_pool_push(sub->packet_pool, sub->cached_pkts[index]);
+        sub->cached_pkts[index] = NULL;
         ++index;
     }
     sub->cached_pkt_pos = 0;
@@ -162,6 +172,7 @@ static struct sd *init_decoder(struct dec_sub *sub)
             .order = sub->order,
             .attachments = sub->attachments,
             .codec = sub->codec,
+            .lang = sub->lang,
             .preload_ok = true,
         };
 
@@ -184,16 +195,18 @@ static struct sd *init_decoder(struct dec_sub *sub)
 struct dec_sub *sub_create(struct mpv_global *global, struct track *track,
                            struct attachment_list *attachments, int order)
 {
-    assert(track->stream && track->stream->type == STREAM_SUB);
+    mp_assert(track->stream && track->stream->type == STREAM_SUB);
 
     struct dec_sub *sub = talloc(NULL, struct dec_sub);
     *sub = (struct dec_sub){
         .log = mp_log_new(sub, global->log, "sub"),
         .global = global,
+        .packet_pool = demux_packet_pool_get(global),
         .opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_sub_opts),
         .shared_opts_cache = m_config_cache_alloc(sub, global, &mp_subtitle_shared_sub_opts),
         .sh = track->stream,
         .codec = track->stream->codec,
+        .lang = track->lang,
         .attachments = talloc_steal(sub, attachments),
         .play_dir = 1,
         .order = order,
@@ -319,7 +332,7 @@ static bool update_pkt_cache(struct dec_sub *sub, double video_pts)
             return true;
     }
 
-    if (pkt && pkt->animated)
+    if (pkt && pkt->animated == 1)
         return true;
 
     return false;
@@ -352,7 +365,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
             break;
 
         // (Use this mechanism only if sub_delay matters to avoid corner cases.)
-        float delay = sub->order < 0 ? 0.0f : sub->shared_opts->sub_delay[sub->order];
+        double delay = sub->order < 0 ? 0.0 : sub->shared_opts->sub_delay[sub->order];
         double min_pts = delay < 0 || force ? video_pts : MP_NOPTS_VALUE;
 
         struct demux_packet *pkt;
@@ -375,7 +388,7 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
         MP_TARRAY_APPEND(sub, sub->cached_pkts, sub->num_cached_pkts, pkt);
 
         if (is_new_segment(sub, pkt)) {
-            sub->new_segment = demux_copy_packet(pkt);
+            sub->new_segment = demux_copy_packet(sub->packet_pool, pkt);
             // Note that this can be delayed to a much later point in time.
             update_segment(sub);
             break;
@@ -482,7 +495,8 @@ void sub_reset(struct dec_sub *sub)
     sub->last_pkt_pts = MP_NOPTS_VALUE;
     sub->last_vo_pts = MP_NOPTS_VALUE;
     destroy_cached_pkts(sub);
-    TA_FREEP(&sub->new_segment);
+    demux_packet_pool_push(sub->packet_pool, sub->new_segment);
+    sub->new_segment = NULL;
     mp_mutex_unlock(&sub->lock);
 }
 
@@ -515,7 +529,7 @@ int sub_control(struct dec_sub *sub, enum sd_ctrl cmd, void *arg)
         break;
     }
     case SD_CTRL_UPDATE_OPTS: {
-        int flags = (uintptr_t)arg;
+        uint64_t flags = *(uint64_t *)arg;
         if (m_config_cache_update(sub->opts_cache))
             update_subtitle_speed(sub);
         m_config_cache_update(sub->shared_opts_cache);
@@ -565,4 +579,59 @@ bool sub_is_secondary_visible(struct dec_sub *sub)
     bool ret = sub->shared_opts->sub_visibility[1];
     mp_mutex_unlock(&sub->lock);
     return ret;
+}
+
+static int sub_line_cmp(const void *a, const void *b)
+{
+    const struct sub_line *la = a, *lb = b;
+    if (la->start < lb->start) return -1;
+    if (la->start > lb->start) return  1;
+    return 0;
+}
+
+static void dedup_sub_lines(struct sub_lines *lines)
+{
+    int window_start = 0;
+    int window_end = 1;
+    int current_shift = 0;
+
+    while (window_end < lines->num_entries) {
+        struct sub_line next = lines->entries[window_end + current_shift];
+        for (int i = window_start; i < window_end; ++i) {
+            if (lines->entries[i].end < next.start) {
+                struct sub_line tmp = lines->entries[window_start];
+                lines->entries[window_start++] = lines->entries[i];
+                lines->entries[i] = tmp;
+                continue;
+            }
+
+            if (!strcmp(lines->entries[i].text, next.text)) {
+                lines->entries[i].end = MPMAX(next.end, lines->entries[i].end);
+                TA_FREEP(&next.text);
+                ++current_shift, --lines->num_entries;
+                goto skip;
+            }
+        }
+
+        lines->entries[window_end++] = next;
+
+    skip:;
+    }
+}
+
+struct sub_lines *sub_get_lines(struct dec_sub *sub)
+{
+    mp_mutex_lock(&sub->lock);
+    struct sub_lines *res = NULL;
+    if (sub->sd->driver->get_lines) {
+        res = sub->sd->driver->get_lines(sub->sd);
+        qsort(res->entries, res->num_entries, sizeof(res->entries[0]),
+              sub_line_cmp);
+        dedup_sub_lines(res);
+        // dedup may sometimes reorder lines to keep its window smaller
+        qsort(res->entries, res->num_entries, sizeof(res->entries[0]),
+              sub_line_cmp);
+    }
+    mp_mutex_unlock(&sub->lock);
+    return res;
 }

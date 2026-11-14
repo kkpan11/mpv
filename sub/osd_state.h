@@ -10,6 +10,8 @@ enum mp_osdtype {
     OSDTYPE_SUB,
     OSDTYPE_SUB2, // IDs must be numerically successive
 
+    OSDTYPE_DISC_MENU,
+
     OSDTYPE_OSD,
 
     OSDTYPE_EXTERNAL,
@@ -44,8 +46,8 @@ struct osd_object {
     struct osd_external **externals;
     int num_externals;
 
-    // OSDTYPE_EXTERNAL2
-    struct sub_bitmaps *external2;
+    // OSDTYPE_EXTERNAL2 / OSDTYPE_DISC_MENU
+    struct sub_bitmaps *image_overlay;
 
     // VO cache state
     int vo_change_id;
@@ -55,7 +57,7 @@ struct osd_object {
     // Internally used by osd_libass.c
     bool changed;
     struct ass_state ass;
-    struct mp_ass_packer *ass_packer;
+    struct mp_sub_packer *sub_packer;
     struct sub_bitmap_copy_cache *copy_cache;
     struct ass_image **ass_imgs;
 };
@@ -88,7 +90,6 @@ struct osd_state {
 // defined in osd_libass.c
 struct sub_bitmaps *osd_object_get_bitmaps(struct osd_state *osd,
                                            struct osd_object *obj, int format);
-void osd_init_backend(struct osd_state *osd);
 void osd_destroy_backend(struct osd_state *osd);
 
 #endif

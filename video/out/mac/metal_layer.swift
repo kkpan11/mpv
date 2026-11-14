@@ -20,6 +20,7 @@ import QuartzCore
 
 class MetalLayer: CAMetalLayer {
     unowned var common: MacCommon
+    var log: LogHelper { return common.log }
 
     // workaround for a MoltenVK workaround that sets the drawableSize to 1x1 to forcefully complete
     // the presentation, this causes flicker and the drawableSize possibly staying at 1x1
@@ -32,11 +33,60 @@ class MetalLayer: CAMetalLayer {
         }
     }
 
+    override var pixelFormat: MTLPixelFormat {
+        didSet {
+            if pixelFormat != oldValue { logState(property: "pixel format") }
+        }
+    }
+
+    // workaround for nil to none-nil values, oldValue is same as current in those cases
+    var previousColorspace: CGColorSpace?
+    override var colorspace: CGColorSpace? {
+        didSet {
+            if colorspace != previousColorspace { logState(property: "colorspace") }
+            previousColorspace = colorspace
+        }
+    }
+
+    override var edrMetadata: CAEDRMetadata? {
+        didSet {
+            if edrMetadata != oldValue { logState(property: "HDR metadata") }
+        }
+    }
+
+    override var wantsExtendedDynamicRangeContent: Bool {
+        didSet {
+            if wantsExtendedDynamicRangeContent != oldValue { logState(property: "HDR") }
+        }
+    }
+
+    override var displaySyncEnabled: Bool {
+        didSet {
+            if displaySyncEnabled != oldValue { logState(property: "display sync") }
+        }
+    }
+
+    // workaround for MoltenVK problem setting this to false even when no transparent content is rendered
+    var wantsAlpha: Bool = false { didSet { isOpaque = !wantsAlpha } }
+    var opaqueForced: Bool = false
+    override var isOpaque: Bool {
+        get { return super.isOpaque }
+        set {
+            opaqueForced = newValue == wantsAlpha
+            if isOpaque == wantsAlpha || opaqueForced {
+                super.isOpaque = !wantsAlpha
+                backgroundColor = (wantsAlpha ? NSColor.clear : NSColor.black).cgColor
+                logState(property: "opaque")
+            }
+        }
+    }
+
     init(common com: MacCommon) {
         common = com
         super.init()
 
         pixelFormat = .rgba16Float
+        previousColorspace = colorspace
         backgroundColor = NSColor.black.cgColor
     }
 
@@ -51,5 +101,22 @@ class MetalLayer: CAMetalLayer {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    func logState(property: String) {
+        let dtdPixelFormats: [MTLPixelFormat] = [
+            .bgra8Unorm,
+            .rgba16Float,
+            .bgr10a2Unorm
+        ]
+        let dtdPossible = isOpaque && dtdPixelFormats.contains(pixelFormat)
+
+        log.verbose("""
+        Metal layer state changed (\(property))
+        Pixel Format: \(pixelFormat.name) - Opaque: \(isOpaque) \(opaqueForced ? "(forced)" : "")
+        Colorspace: \(colorspace?.longName ?? "nil")
+        HDR: \(wantsExtendedDynamicRangeContent ? "active" : "inactive") - Metadata: \(edrMetadata?.description ?? "nil")
+        Direct-to-Display: \(dtdPossible ? "possible" : "inactive") - Display Sync: \(displaySyncEnabled ? "active" : "inactive")
+        """)
     }
 }

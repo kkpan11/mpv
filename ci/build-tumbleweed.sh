@@ -1,18 +1,20 @@
 #!/bin/sh
 set -e
 
-meson setup build \
-  --werror        \
-  -Dc_args="-Wno-error=deprecated -Wno-error=deprecated-declarations" \
+. ./ci/build-common.sh
+
+meson setup build $common_args $@ \
   -Db_sanitize=address,undefined \
-  -Dcdda=enabled          \
-  -Ddvbin=enabled         \
-  -Ddvdnav=enabled        \
-  -Dlibarchive=enabled    \
-  -Dlibmpv=true           \
+  -Dcdda=enabled \
+  -Ddvbin=enabled \
+  -Ddvda=enabled \
+  -Ddvdnav=enabled \
+  -Dlibarchive=enabled \
   -Dmanpage-build=enabled \
-  -Dpipewire=enabled      \
-  -Dtests=true            \
+  -Dpipewire=enabled \
+  -Dsixel=enabled \
+  -Dsubrandr=enabled \
+  -Dvapoursynth=enabled \
   -Dvulkan=enabled
 meson compile -C build
 ./build/mpv -v --no-config

@@ -24,6 +24,7 @@ extension MenuBar {
 
     enum `Type`: Comparable {
         case menu
+        case menuWindow
         case menuServices
         case separator
         case item
@@ -49,7 +50,7 @@ extension MenuBar {
             name: String = "",
             key: String = "",
             modifiers: NSEvent.ModifierFlags = .command,
-            type: Type = .item,
+            type: Type? = nil,
             action: Selector? = nil,
             target: AnyObject? = nil,
             command: String = "",
@@ -59,7 +60,7 @@ extension MenuBar {
             self.name = name
             self.key = key
             self.modifiers = modifiers
-            self.type = configs.isEmpty ? type : .menu
+            self.type = type ?? (configs.isEmpty ? .item : .menu)
             self.action = action
             self.target = target
             self.command = command
@@ -69,13 +70,21 @@ extension MenuBar {
     }
 }
 
-class MenuBar: NSObject {
+class MenuBar: NSObject, EventSubscriber {
     unowned let appHub: AppHub
+    var option: OptionHelper? { return appHub.option }
+    var event: EventHelper? { return appHub.event }
     let mainMenu = NSMenu(title: "Main")
     let servicesMenu = NSMenu(title: "Services")
     var menuConfigs: [Config] = []
-    var dynamicMenuItems: [Type:[MenuItem]] = [:]
+    var dynamicMenuItems: [Type: [MenuItem]] = [:]
+    let dialog: Dialog
     let appIcon: NSImage
+    var path: String?
+    var currentDir: URL? {
+        guard let path = path, !path.isUrl() else { return nil }
+        return URL(fileURLWithPath: path).deletingLastPathComponent()
+    }
 
     @objc init(_ appHub: AppHub) {
         self.appHub = appHub
@@ -84,6 +93,7 @@ class MenuBar: NSObject {
         UserDefaults.standard.set(true, forKey: "NSDisabledCharacterPaletteMenuItem")
         NSWindow.allowsAutomaticWindowTabbing = false
         appIcon = appHub.getIcon()
+        dialog = Dialog(appHub.option)
 
         super.init()
 
@@ -111,7 +121,7 @@ class MenuBar: NSObject {
             Config(name: "Show All", action: #selector(NSApp.unhideAllApplications(_:))),
             Config(type: .separator),
             Config(name: "Quit and Remember Position", action: #selector(command(_:)), target: self, command: "quit-watch-later"),
-            Config(name: "Quit mpv", key: "q", action: #selector(command(_:)), target: self, command: "quit"),
+            Config(name: "Quit mpv", key: "q", action: #selector(command(_:)), target: self, command: "quit")
         ]
 
         let fileMenuConfigs = [
@@ -120,7 +130,7 @@ class MenuBar: NSObject {
             Config(name: "Open Playlist…", action: #selector(openPlaylist), target: self),
             Config(type: .separator),
             Config(name: "Close", key: "w", action: #selector(NSWindow.performClose(_:))),
-            Config(name: "Save Screenshot", action: #selector(command(_:)), target: self, command: "async screenshot"),
+            Config(name: "Save Screenshot", action: #selector(command(_:)), target: self, command: "async screenshot")
         ]
 
         let editMenuConfigs = [
@@ -130,7 +140,7 @@ class MenuBar: NSObject {
             Config(name: "Cut", key: "x", action: #selector(NSText.cut(_:))),
             Config(name: "Copy", key: "c", action: #selector(NSText.copy(_:))),
             Config(name: "Paste", key: "v", action: #selector(NSText.paste(_:))),
-            Config(name: "Select All", key: "a", action: #selector(NSResponder.selectAll(_:))),
+            Config(name: "Select All", key: "a", action: #selector(NSResponder.selectAll(_:)))
         ]
 
         var viewMenuConfigs = [
@@ -141,12 +151,12 @@ class MenuBar: NSObject {
                 action: #selector(command(_:)),
                 target: self,
                 command: "cycle on-all-workspaces"
-            ),
+            )
         ]
 #if HAVE_MACOS_TOUCHBAR
         viewMenuConfigs += [
             Config(type: .separator),
-            Config(name: "Customize Touch Bar…", action: #selector(NSApp.toggleTouchBarCustomizationPalette(_:))),
+            Config(name: "Customize Touch Bar…", action: #selector(NSApp.toggleTouchBarCustomizationPalette(_:)))
         ]
 #endif
 
@@ -167,7 +177,7 @@ class MenuBar: NSObject {
             Config(type: .separator),
             Config(name: "Half Size", key: "0", type: .itemHalfSize),
             Config(name: "Normal Size", key: "1", type: .itemNormalSize),
-            Config(name: "Double Size", key: "2", type: .itemDoubleSize),
+            Config(name: "Double Size", key: "2", type: .itemDoubleSize)
         ]
 
         let audioMenuConfigs = [
@@ -178,7 +188,7 @@ class MenuBar: NSObject {
             Config(type: .separator),
             Config(name: "Play Audio Later", action: #selector(command(_:)), target: self, command: "add audio-delay 0.1"),
             Config(name: "Play Audio Earlier", action: #selector(command(_:)), target: self, command: "add audio-delay -0.1"),
-            Config(name: "Reset Audio Delay", action: #selector(command(_:)), target: self, command: "set audio-delay 0.0"),
+            Config(name: "Reset Audio Delay", action: #selector(command(_:)), target: self, command: "set audio-delay 0.0")
         ]
 
         let subtitleMenuConfigs = [
@@ -189,7 +199,7 @@ class MenuBar: NSObject {
             Config(type: .separator),
             Config(name: "Display Subtitles Later", action: #selector(command(_:)), target: self, command: "add sub-delay 0.1"),
             Config(name: "Display Subtitles Earlier", action: #selector(command(_:)), target: self, command: "add sub-delay -0.1"),
-            Config(name: "Reset Subtitle Delay", action: #selector(command(_:)), target: self, command: "set sub-delay 0.0"),
+            Config(name: "Reset Subtitle Delay", action: #selector(command(_:)), target: self, command: "set sub-delay 0.0")
         ]
 
         let playbackMenuConfigs = [
@@ -198,9 +208,9 @@ class MenuBar: NSObject {
             Config(name: "Decrease Speed", action: #selector(command(_:)), target: self, command: "add speed -0.1"),
             Config(name: "Reset Speed", action: #selector(command(_:)), target: self, command: "set speed 1.0"),
             Config(type: .separator),
-            Config(name: "Show Playlist", action: #selector(command(_:)), target: self, command: "script-message osc-playlist"),
-            Config(name: "Show Chapters", action: #selector(command(_:)), target: self, command: "script-message osc-chapterlist"),
-            Config(name: "Show Tracks", action: #selector(command(_:)), target: self, command: "script-message osc-tracklist"),
+            Config(name: "Show Playlist", action: #selector(command(_:)), target: self, command: "show-text ${playlist} 3000"),
+            Config(name: "Show Chapters", action: #selector(command(_:)), target: self, command: "show-text ${chapter-list} 3000"),
+            Config(name: "Show Tracks", action: #selector(command(_:)), target: self, command: "show-text ${track-list} 3000"),
             Config(type: .separator),
             Config(name: "Next File", action: #selector(command(_:)), target: self, command: "playlist-next"),
             Config(name: "Previous File", action: #selector(command(_:)), target: self, command: "playlist-prev"),
@@ -212,12 +222,12 @@ class MenuBar: NSObject {
             Config(name: "Previous Chapter", action: #selector(command(_:)), target: self, command: "add chapter -1"),
             Config(type: .separator),
             Config(name: "Step Forward", action: #selector(command(_:)), target: self, command: "frame-step"),
-            Config(name: "Step Backward", action: #selector(command(_:)), target: self, command: "frame-back-step"),
+            Config(name: "Step Backward", action: #selector(command(_:)), target: self, command: "frame-back-step")
         ]
 
         let windowMenuConfigs = [
             Config(name: "Minimize", key: "m", type: .itemMinimize),
-            Config(name: "Zoom", type: .itemZoom),
+            Config(name: "Zoom", type: .itemZoom)
         ]
 
         var helpMenuConfigs = [
@@ -229,9 +239,9 @@ class MenuBar: NSObject {
             Config(name: "Release Notes…", action: #selector(url(_:)), target: self, url: "https://github.com/mpv-player/mpv/blob/master/RELEASE_NOTES"),
             Config(name: "Keyboard Shortcuts…", action: #selector(url(_:)), target: self, url: "https://github.com/mpv-player/mpv/blob/master/etc/input.conf"),
             Config(type: .separator),
-            Config(name: "Report Issue…", action: #selector(url(_:)), target: self, url: "https://github.com/mpv-player/mpv/issues/new/choose"),
+            Config(name: "Report Issue…", action: #selector(url(_:)), target: self, url: "https://github.com/mpv-player/mpv/issues/new/choose")
         ]
-        if ProcessInfo.processInfo.environment["MPVBUNDLE"] == "true" {
+        if AppHub.shared.isBundle {
             helpMenuConfigs += [
                 Config(name: "Show log File…", action: #selector(showFile(_:)), target: self, url: NSHomeDirectory() + "/Library/Logs/mpv.log")
             ]
@@ -246,13 +256,15 @@ class MenuBar: NSObject {
             Config(name: "Audio", configs: audioMenuConfigs),
             Config(name: "Subtitle", configs: subtitleMenuConfigs),
             Config(name: "Playback", configs: playbackMenuConfigs),
-            Config(name: "Window", configs: windowMenuConfigs),
-            Config(name: "Help", configs: helpMenuConfigs),
+            Config(name: "Window", type: .menuWindow, configs: windowMenuConfigs),
+            Config(name: "Help", configs: helpMenuConfigs)
         ]
 
         createMenu(parentMenu: mainMenu, configs: menuConfigs)
         NSApp.mainMenu = mainMenu
         NSApp.servicesMenu = servicesMenu
+
+        event?.subscribe(self, event: .init(name: "path", format: MPV_FORMAT_STRING))
     }
 
     func createMenu(parentMenu: NSMenu, configs: [Config]) {
@@ -263,6 +275,10 @@ class MenuBar: NSObject {
                 let menu = config.type == .menuServices ? servicesMenu : NSMenu(title: config.name)
                 item.submenu = menu
                 createMenu(parentMenu: menu, configs: config.configs)
+
+                if config.type == .menuWindow {
+                    NSApp.windowsMenu = menu
+                }
             }
 
             if config.type > Type.item {
@@ -272,7 +288,8 @@ class MenuBar: NSObject {
     }
 
     func createMenuItem(parentMenu: NSMenu, config: Config) -> MenuItem {
-        var item = MenuItem(title: config.name, action: config.action, keyEquivalent: config.key)
+        var item = MenuItem(title: config.name, action: config.action,
+              keyEquivalent: (option?.mac.macos_menu_shortcuts ?? true) ? config.key : "")
         item.config = config
         item.target = config.target
         item.keyEquivalentModifierMask = config.modifiers
@@ -290,7 +307,7 @@ class MenuBar: NSObject {
             .applicationName: "mpv",
             .applicationIcon: appIcon,
             .applicationVersion: String(cString: swift_mpv_version),
-            .init(rawValue: "Copyright"): String(cString: swift_mpv_copyright),
+            .init(rawValue: "Copyright"): String(cString: swift_mpv_copyright)
         ])
     }
 
@@ -298,7 +315,7 @@ class MenuBar: NSObject {
         guard let menuConfig = menuItem.config else { return }
         let configPaths: [URL] = [
             URL(fileURLWithPath: NSHomeDirectory() + "/.config/mpv/", isDirectory: true),
-            URL(fileURLWithPath: NSHomeDirectory() + "/.mpv/", isDirectory: true),
+            URL(fileURLWithPath: NSHomeDirectory() + "/.mpv/", isDirectory: true)
         ]
 
         for path in configPaths {
@@ -309,53 +326,30 @@ class MenuBar: NSObject {
                     return
                 }
                 NSWorkspace.shared.open(path)
-                alert(title: "No Application found to open your config file.", text: "Please open the \(menuConfig.url) file with your preferred text editor in the now open folder to edit your config.")
+                dialog.alert(title: "No Application found to open your config file.", text: "Please open the \(menuConfig.url) file with your preferred text editor in the now open folder to edit your config.")
                 return
             }
 
             if NSWorkspace.shared.open(path) {
-                alert(title: "No config file found.", text: "Please create a \(menuConfig.url) file with your preferred text editor in the now open folder.")
+                dialog.alert(title: "No config file found.", text: "Please create a \(menuConfig.url) file with your preferred text editor in the now open folder.")
                 return
             }
         }
     }
 
     @objc func openFiles() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = true
-
-        if panel.runModal() == .OK {
-            appHub.input.open(files: panel.urls.map { $0.path })
-        }
+        guard let files = dialog.openFiles(path: currentDir) else { return }
+        appHub.input.open(files: files)
     }
 
     @objc func openPlaylist() {
-        let panel = NSOpenPanel()
-
-        if panel.runModal() == .OK, let url = panel.urls.first {
-            appHub.input.command("loadlist \"\(url.path)\"")
-        }
+        guard let file = dialog.openPlaylist(path: currentDir) else { return }
+        appHub.input.command("loadlist \"\(file)\"")
     }
 
     @objc func openUrl() {
-        let alert = NSAlert()
-        alert.messageText = "Open URL"
-        alert.icon = appIcon
-        alert.addButton(withTitle: "Ok")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-        input.placeholderString = "URL"
-        alert.accessoryView = input
-
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.1) {
-            input.becomeFirstResponder()
-        }
-
-        if alert.runModal() == .alertFirstButtonReturn && input.stringValue.count > 0 {
-            appHub.input.open(files: [input.stringValue])
-        }
+        guard let file = dialog.openUrl() else { return }
+        appHub.input.open(files: [file])
     }
 
     @objc func command(_ menuItem: MenuItem) {
@@ -377,21 +371,19 @@ class MenuBar: NSObject {
             return
         }
 
-        alert(title: "No log File found.", text: "You deactivated logging for the Bundle.")
-    }
-
-    func alert(title: String, text: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = text
-        alert.icon = appIcon
-        alert.addButton(withTitle: "Ok")
-        alert.runModal()
+        dialog.alert(title: "No log File found.", text: "You deactivated logging for the Bundle.")
     }
 
     func register(_ selector: Selector, key: Type) {
         for menuItem in dynamicMenuItems[key] ?? [] {
             menuItem.action = selector
+        }
+    }
+
+    func handle(event: EventHelper.Event) {
+        switch event.name {
+        case "path": path = event.string
+        default: break
         }
     }
 }

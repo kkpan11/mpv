@@ -15,6 +15,7 @@ bool mpvk_init(struct mpvk_ctx *vk, struct ra_ctx *ctx, const char *surface_ext)
     mppl_log_set_probing(vk->pllog, true);
     vk->vkinst = pl_vk_inst_create(vk->pllog, &(struct pl_vk_inst_params) {
         .debug = ctx->opts.debug,
+        .debug_extra = ctx->opts.debug,
         .extensions = exts,
         .num_extensions = MP_ARRAY_SIZE(exts),
     });
@@ -32,8 +33,12 @@ error:
 void mpvk_uninit(struct mpvk_ctx *vk)
 {
     if (vk->surface) {
-        assert(vk->vkinst);
-        vkDestroySurfaceKHR(vk->vkinst->instance, vk->surface, NULL);
+        mp_assert(vk->vkinst);
+        mp_assert(vk->vkinst->get_proc_addr);
+        PFN_vkDestroySurfaceKHR pDestroySurfaceKHR = (PFN_vkDestroySurfaceKHR)
+            vk->vkinst->get_proc_addr(vk->vkinst->instance, "vkDestroySurfaceKHR");
+        if (pDestroySurfaceKHR)
+            pDestroySurfaceKHR(vk->vkinst->instance, vk->surface, NULL);
         vk->surface = VK_NULL_HANDLE;
     }
 

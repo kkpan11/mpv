@@ -18,9 +18,8 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/types.h>
-#include <unistd.h>
 
-#ifdef __MINGW32__
+#ifdef _WIN32
 #include <windows.h>
 #else
 #include <poll.h>
@@ -61,7 +60,7 @@ uintptr_t mp_waiter_wait(struct mp_waiter *waiter)
 void mp_waiter_wakeup(struct mp_waiter *waiter, uintptr_t value)
 {
     mp_mutex_lock(&waiter->lock);
-    assert(!waiter->done);
+    mp_assert(!waiter->done);
     waiter->done = true;
     waiter->value = value;
     mp_cond_signal(&waiter->wakeup);
@@ -103,7 +102,7 @@ static void cancel_destroy(void *p)
 {
     struct mp_cancel *c = p;
 
-    assert(!c->slaves.head); // API user error
+    mp_assert(!c->slaves.head); // API user error
 
     mp_cancel_set_parent(c, NULL);
 
@@ -112,7 +111,7 @@ static void cancel_destroy(void *p)
         close(c->wakeup_pipe[1]);
     }
 
-#ifdef __MINGW32__
+#ifdef _WIN32
     if (c->win32_event)
         CloseHandle(c->win32_event);
 #endif
@@ -149,7 +148,7 @@ static void trigger_locked(struct mp_cancel *c)
     if (c->wakeup_pipe[1] >= 0)
         (void)write(c->wakeup_pipe[1], &(char){0}, 1);
 
-#ifdef __MINGW32__
+#ifdef _WIN32
     if (c->win32_event)
         SetEvent(c->win32_event);
 #endif
@@ -177,7 +176,7 @@ void mp_cancel_reset(struct mp_cancel *c)
         }
     }
 
-#ifdef __MINGW32__
+#ifdef _WIN32
     if (c->win32_event)
         ResetEvent(c->win32_event);
 #endif
@@ -261,7 +260,7 @@ int mp_cancel_get_fd(struct mp_cancel *c)
     return c->wakeup_pipe[0];
 }
 
-#ifdef __MINGW32__
+#ifdef _WIN32
 void *mp_cancel_get_event(struct mp_cancel *c)
 {
     mp_mutex_lock(&c->lock);

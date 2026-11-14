@@ -22,7 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include <errno.h>
@@ -101,6 +100,10 @@ const struct keymap_entry keys[] = {
     {SDLK_LEFT, MP_KEY_LEFT},
     {SDLK_DOWN, MP_KEY_DOWN},
     {SDLK_UP, MP_KEY_UP},
+    {SDLK_KP_PLUS, MP_KEY_KPADD},
+    {SDLK_KP_MINUS, MP_KEY_KPSUBTRACT},
+    {SDLK_KP_MULTIPLY, MP_KEY_KPMULTIPLY},
+    {SDLK_KP_DIVIDE, MP_KEY_KPDIVIDE},
     {SDLK_KP_ENTER, MP_KEY_KPENTER},
     {SDLK_KP_1, MP_KEY_KP1},
     {SDLK_KP_2, MP_KEY_KP2},
@@ -253,7 +256,7 @@ static bool is_good_renderer(SDL_RendererInfo *ri,
 
     int i, j;
     for (i = 0; i < ri->num_texture_formats; ++i)
-        for (j = 0; j < sizeof(formats) / sizeof(formats[0]); ++j)
+        for (j = 0; j < MP_ARRAY_SIZE(formats); ++j)
             if (ri->texture_formats[i] == formats[j].sdl)
                 if (formats[j].is_rgba) {
                     if (osd_format)
@@ -450,7 +453,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct mp_rect screenrc;
 
     update_screeninfo(vo, &screenrc);
-    vo_calc_window_geometry(vo, &screenrc, &geo);
+    vo_calc_window_geometry(vo, vc->opts_cache->opts, &screenrc, &screenrc, 1.0, false, &geo, NULL);
     vo_apply_window_geometry(vo, &geo);
 
     int win_w = vo->dwidth;
@@ -465,7 +468,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     Uint32 texfmt = SDL_PIXELFORMAT_UNKNOWN;
     int i, j;
     for (i = 0; i < vc->renderer_info.num_texture_formats; ++i)
-        for (j = 0; j < sizeof(formats) / sizeof(formats[0]); ++j)
+        for (j = 0; j < MP_ARRAY_SIZE(formats); ++j)
             if (vc->renderer_info.texture_formats[i] == formats[j].sdl)
                 if (params->imgfmt == formats[j].mpv)
                     texfmt = formats[j].sdl;
@@ -586,7 +589,7 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
             // The default config does not use Ctrl, so this is fine...
             int keycode = 0;
             int i;
-            for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i)
+            for (i = 0; i < MP_ARRAY_SIZE(keys); ++i)
                 if (keys[i].sdl == ev.key.keysym.sym) {
                     keycode = keys[i].mpv;
                     break;
@@ -605,11 +608,11 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
             break;
         }
         case SDL_MOUSEMOTION:
-            mp_input_set_mouse_pos(vo->input_ctx, ev.motion.x, ev.motion.y);
+            mp_input_set_mouse_pos(vo->input_ctx, ev.motion.x, ev.motion.y, false);
             break;
         case SDL_MOUSEBUTTONDOWN: {
             int i;
-            for (i = 0; i < sizeof(mousebtns) / sizeof(mousebtns[0]); ++i)
+            for (i = 0; i < MP_ARRAY_SIZE(mousebtns); ++i)
                 if (mousebtns[i].sdl == ev.button.button) {
                     mp_input_put_key(vo->input_ctx, mousebtns[i].mpv | MP_KEY_STATE_DOWN);
                     break;
@@ -618,7 +621,7 @@ static void wait_events(struct vo *vo, int64_t until_time_ns)
         }
         case SDL_MOUSEBUTTONUP: {
             int i;
-            for (i = 0; i < sizeof(mousebtns) / sizeof(mousebtns[0]); ++i)
+            for (i = 0; i < MP_ARRAY_SIZE(mousebtns); ++i)
                 if (mousebtns[i].sdl == ev.button.button) {
                     mp_input_put_key(vo->input_ctx, mousebtns[i].mpv | MP_KEY_STATE_UP);
                     break;
@@ -869,14 +872,14 @@ static int query_format(struct vo *vo, int format)
     struct priv *vc = vo->priv;
     int i, j;
     for (i = 0; i < vc->renderer_info.num_texture_formats; ++i)
-        for (j = 0; j < sizeof(formats) / sizeof(formats[0]); ++j)
+        for (j = 0; j < MP_ARRAY_SIZE(formats); ++j)
             if (vc->renderer_info.texture_formats[i] == formats[j].sdl)
                 if (format == formats[j].mpv)
                     return 1;
     return 0;
 }
 
-static void draw_frame(struct vo *vo, struct vo_frame *frame)
+static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *vc = vo->priv;
 
@@ -891,7 +894,7 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
 
         mp_image_t texmpi;
         if (!lock_texture(vo, &texmpi))
-            return;
+            goto done;
 
         mp_image_copy(&texmpi, frame->current);
 
@@ -911,6 +914,9 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
     SDL_RenderCopy(vc->renderer, vc->tex, &src, &dst);
 
     draw_osd(vo);
+
+done:
+    return VO_TRUE;
 }
 
 static struct mp_image *get_window_screenshot(struct vo *vo)

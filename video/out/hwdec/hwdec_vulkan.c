@@ -34,6 +34,8 @@ struct vulkan_mapper_priv {
     struct mp_image layout;
     AVVkFrame *vkf;
     pl_tex tex[4];
+    bool multiplane;
+    bool accessed;
 };
 
 static void lock_queue(struct AVHWDeviceContext *ctx,
@@ -74,26 +76,25 @@ static int vulkan_init(struct ra_hwdec *hw)
      * one is the decode queue.
      */
     uint32_t num_qf = 0;
-    VkQueueFamilyProperties *qf = NULL;
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->vulkan->phys_device, &num_qf, NULL);
+    VkQueueFamilyProperties2 *qf = NULL;
+    VkQueueFamilyVideoPropertiesKHR *qf_vid = NULL;
+    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, NULL);
     if (!num_qf)
         goto error;
 
-    qf = talloc_array(NULL, VkQueueFamilyProperties, num_qf);
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->vulkan->phys_device, &num_qf, qf);
-
-    int decode_index = -1, decode_count = 0;
+    qf = talloc_array(NULL, VkQueueFamilyProperties2, num_qf);
+    qf_vid = talloc_array(NULL, VkQueueFamilyVideoPropertiesKHR, num_qf);
     for (int i = 0; i < num_qf; i++) {
-        /*
-         * Pick the first discovered decode queue that we find. Maybe a day will
-         * come when this needs to be smarter, but I'm sure a bunch of other
-         * things will have to change too.
-         */
-        if ((qf[i].queueFlags) & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
-            decode_index = i;
-            decode_count = qf[i].queueCount;
-        }
+        qf_vid[i] = (VkQueueFamilyVideoPropertiesKHR) {
+            .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR,
+        };
+        qf[i] = (VkQueueFamilyProperties2) {
+            .sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
+            .pNext = &qf_vid[i],
+        };
     }
+
+    vkGetPhysicalDeviceQueueFamilyProperties2(vk->vulkan->phys_device, &num_qf, qf);
 
     hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VULKAN);
     if (!hw_device_ctx)
@@ -103,8 +104,19 @@ static int vulkan_init(struct ra_hwdec *hw)
     AVVulkanDeviceContext *device_hwctx = device_ctx->hwctx;
 
     device_ctx->user_opaque = (void *)vk->vulkan;
-    device_hwctx->lock_queue = lock_queue;
-    device_hwctx->unlock_queue = unlock_queue;
+    // libavutil deprecated AVVulkanDeviceContext.lock/unlock_queue in favour
+    // of `VK_KHR_internally_synchronized_queues`. Set the callbacks as long as
+    // they exist. They are no-ops in libplacebo when mppl_create_vulkan
+    // requested internally synchronized queues, and take libplacebo's queue
+    // locks otherwise.
+    //
+    // It's unclear what will happen to devices that do not support
+    // `VK_KHR_internally_synchronized_queues` when the lock/unlock_queue
+    // callbacks are removed.
+#if LIBAVUTIL_VERSION_MAJOR < 62
+    AV_NOWARN_DEPRECATED(device_hwctx->lock_queue = lock_queue;)
+    AV_NOWARN_DEPRECATED(device_hwctx->unlock_queue = unlock_queue;)
+#endif
     device_hwctx->get_proc_addr = vk->vkinst->get_proc_addr;
     device_hwctx->inst = vk->vkinst->instance;
     device_hwctx->phys_dev = vk->vulkan->phys_device;
@@ -114,6 +126,57 @@ static int vulkan_init(struct ra_hwdec *hw)
     device_hwctx->nb_enabled_inst_extensions = vk->vkinst->num_extensions;
     device_hwctx->enabled_dev_extensions = vk->vulkan->extensions;
     device_hwctx->nb_enabled_dev_extensions = vk->vulkan->num_extensions;
+
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 32, 100)
+    // libplacebo uses the same flags for all queues, so grab them from the
+    // queue we know we'll have
+    device_hwctx->queue_flags = vk->vulkan->queue_graphics.flags;
+#endif
+
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 34, 100)
+    device_hwctx->nb_qf = 0;
+    device_hwctx->qf[device_hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {
+        .idx = vk->vulkan->queue_graphics.index,
+        .num = vk->vulkan->queue_graphics.count,
+        .flags = VK_QUEUE_GRAPHICS_BIT,
+    };
+    device_hwctx->qf[device_hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {
+        .idx = vk->vulkan->queue_transfer.index,
+        .num = vk->vulkan->queue_transfer.count,
+        .flags = VK_QUEUE_TRANSFER_BIT,
+    };
+    device_hwctx->qf[device_hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {
+        .idx = vk->vulkan->queue_compute.index,
+        .num = vk->vulkan->queue_compute.count,
+        .flags = VK_QUEUE_COMPUTE_BIT,
+    };
+    for (int i = 0; i < num_qf; i++) {
+        if ((qf[i].queueFamilyProperties.queueFlags) & VK_QUEUE_VIDEO_DECODE_BIT_KHR) {
+            device_hwctx->qf[device_hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {
+                .idx = i,
+                .num = qf[i].queueFamilyProperties.queueCount,
+                .flags = VK_QUEUE_VIDEO_DECODE_BIT_KHR,
+                .video_caps = qf_vid[i].videoCodecOperations,
+            };
+        }
+    }
+#ifdef VK_NV_optical_flow
+    for (int i = 0; i < num_qf; i++) {
+        if ((qf[i].queueFamilyProperties.queueFlags) & VK_QUEUE_OPTICAL_FLOW_BIT_NV) {
+            device_hwctx->qf[device_hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {
+                .idx = i,
+                .num = qf[i].queueFamilyProperties.queueCount,
+                .flags = VK_QUEUE_OPTICAL_FLOW_BIT_NV,
+            };
+        }
+    }
+#endif
+#else
+    int decode_index = -1;
+    for (int i = 0; i < num_qf; i++) {
+        if ((qf[i].queueFamilyProperties.queueFlags) & VK_QUEUE_VIDEO_DECODE_BIT_KHR)
+            decode_index = i;
+    }
     device_hwctx->queue_family_index = vk->vulkan->queue_graphics.index;
     device_hwctx->nb_graphics_queues = vk->vulkan->queue_graphics.count;
     device_hwctx->queue_family_tx_index = vk->vulkan->queue_transfer.index;
@@ -121,7 +184,8 @@ static int vulkan_init(struct ra_hwdec *hw)
     device_hwctx->queue_family_comp_index = vk->vulkan->queue_compute.index;
     device_hwctx->nb_comp_queues = vk->vulkan->queue_compute.count;
     device_hwctx->queue_family_decode_index = decode_index;
-    device_hwctx->nb_decode_queues = decode_count;
+    device_hwctx->nb_decode_queues = qf[decode_index].queueFamilyProperties.queueCount;
+#endif
 
     ret = av_hwdevice_ctx_init(hw_device_ctx);
     if (ret < 0) {
@@ -137,10 +201,12 @@ static int vulkan_init(struct ra_hwdec *hw)
     hwdec_devices_add(hw->devs, &p->hwctx);
 
     talloc_free(qf);
+    talloc_free(qf_vid);
     return 0;
 
  error:
     talloc_free(qf);
+    talloc_free(qf_vid);
     av_buffer_unref(&hw_device_ctx);
     return -1;
 }
@@ -175,32 +241,51 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 
 }
 
-static void mapper_unmap(struct ra_hwdec_mapper *mapper)
+// Hand the frame over to libplacebo for one render. FFmpeg's frame lock stays
+// held until mapper_end_access, as required around command submission.
+static int mapper_begin_access(struct ra_hwdec_mapper *mapper)
 {
     struct vulkan_hw_priv *p_owner = mapper->owner->priv;
     struct vulkan_mapper_priv *p = mapper->priv;
-    if (!mapper->src)
-        goto end;
-
-    AVHWFramesContext *hwfc = (AVHWFramesContext *) mapper->src->hwctx->data;;
-    const AVVulkanFramesContext *vkfc = hwfc->hwctx;;
+    AVHWFramesContext *hwfc = (AVHWFramesContext *) mapper->src->hwctx->data;
+    const AVVulkanFramesContext *vkfc = hwfc->hwctx;
     AVVkFrame *vkf = p->vkf;
 
-    int num_images;
-    for (num_images = 0; (vkf->img[num_images] != VK_NULL_HANDLE); num_images++);
+    vkfc->lock_frame(hwfc, vkf);
+    p->accessed = true;
 
-    for (int i = 0; (p->tex[i] != NULL); i++) {
-        pl_tex *tex = &p->tex[i];
-        if (!*tex)
-            continue;
+    for (int i = 0; i < p->layout.num_planes; i++) {
+        int index = p->multiplane ? 0 : i;
+        pl_vulkan_release_ex(p_owner->gpu, pl_vulkan_release_params(
+            .tex = p->tex[i],
+            .layout = vkf->layout[index],
+            .qf = VK_QUEUE_FAMILY_IGNORED,
+            .semaphore = (pl_vulkan_sem) {
+                .sem = vkf->sem[index],
+                .value = vkf->sem_value[index],
+            },
+        ));
+    }
 
-        // If we have multiple planes and one image, then that is a multiplane
-        // frame. Anything else is treated as one-image-per-plane.
-        int index = p->layout.num_planes > 1 && num_images == 1 ? 0 : i;
+    return 0;
+}
 
-        // Update AVVkFrame state to reflect current layout
+// Take the frame back from libplacebo and record its state for the decoder.
+static void mapper_end_access(struct ra_hwdec_mapper *mapper)
+{
+    struct vulkan_hw_priv *p_owner = mapper->owner->priv;
+    struct vulkan_mapper_priv *p = mapper->priv;
+    if (!p->accessed)
+        return;
+
+    AVHWFramesContext *hwfc = (AVHWFramesContext *) mapper->src->hwctx->data;
+    const AVVulkanFramesContext *vkfc = hwfc->hwctx;
+    AVVkFrame *vkf = p->vkf;
+
+    for (int i = 0; i < p->layout.num_planes; i++) {
+        int index = p->multiplane ? 0 : i;
         bool ok = pl_vulkan_hold_ex(p_owner->gpu, pl_vulkan_hold_params(
-            .tex = *tex,
+            .tex = p->tex[i],
             .out_layout = &vkf->layout[index],
             .qf = VK_QUEUE_FAMILY_IGNORED,
             .semaphore = (pl_vulkan_sem) {
@@ -211,21 +296,29 @@ static void mapper_unmap(struct ra_hwdec_mapper *mapper)
 
         vkf->access[index] = 0;
         vkf->sem_value[index] += !!ok;
-        *tex = NULL;
     }
 
     vkfc->unlock_frame(hwfc, vkf);
+    p->accessed = false;
+}
 
- end:
-    for (int i = 0; i < p->layout.num_planes; i++)
+static void mapper_unmap(struct ra_hwdec_mapper *mapper)
+{
+    struct vulkan_mapper_priv *p = mapper->priv;
+
+    // Wrapped images have to be held by us when their wrapper is destroyed.
+    mapper_end_access(mapper);
+
+    for (int i = 0; i < p->layout.num_planes; i++) {
         ra_tex_free(mapper->ra, &mapper->tex[i]);
+        p->tex[i] = NULL;
+    }
 
     p->vkf = NULL;
 }
 
 static int mapper_map(struct ra_hwdec_mapper *mapper)
 {
-    bool result = false;
     struct vulkan_hw_priv *p_owner = mapper->owner->priv;
     struct vulkan_mapper_priv *p = mapper->priv;
     pl_vulkan vk = pl_vulkan_get(p_owner->gpu);
@@ -250,16 +343,15 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     for (num_images = 0; (vkf->img[num_images] != VK_NULL_HANDLE); num_images++);
     const VkFormat *vk_fmt = av_vkfmt_from_pixfmt(hwfc->sw_format);
 
-    vkfc->lock_frame(hwfc, vkf);
+    p->multiplane = p->layout.num_planes > 1 && num_images == 1;
+    p->vkf = vkf;
 
     for (int i = 0; i < p->layout.num_planes; i++) {
         pl_tex *tex = &p->tex[i];
         VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         int index = i;
 
-        // If we have multiple planes and one image, then that is a multiplane
-        // frame. Anything else is treated as one-image-per-plane.
-        if (p->layout.num_planes > 1 && num_images == 1) {
+        if (p->multiplane) {
             index = 0;
 
             switch (i) {
@@ -277,6 +369,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             }
         }
 
+        // The wrapped image starts out held by us. It is handed to
+        // libplacebo per render in mapper_begin_access.
         *tex = pl_vulkan_wrap(p_owner->gpu, pl_vulkan_wrap_params(
             .image = vkf->img[index],
             .width = mp_image_plane_w(&raw_layout, i),
@@ -288,19 +382,8 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         if (!*tex)
             goto error;
 
-        pl_vulkan_release_ex(p_owner->gpu, pl_vulkan_release_params(
-            .tex = p->tex[i],
-            .layout = vkf->layout[index],
-            .qf = VK_QUEUE_FAMILY_IGNORED,
-            .semaphore = (pl_vulkan_sem) {
-                .sem = vkf->sem[index],
-                .value = vkf->sem_value[index],
-            },
-        ));
-
         struct ra_tex *ratex = talloc_ptrtype(NULL, ratex);
-        result = mppl_wrap_tex(mapper->ra, *tex, ratex);
-        if (!result) {
+        if (!mppl_wrap_tex(mapper->ra, *tex, ratex)) {
             pl_tex_destroy(p_owner->gpu, tex);
             talloc_free(ratex);
             goto error;
@@ -308,11 +391,9 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
         mapper->tex[i] = ratex;
     }
 
-    p->vkf = vkf;
     return 0;
 
  error:
-    vkfc->unlock_frame(hwfc, vkf);
     mapper_unmap(mapper);
     return -1;
 }
@@ -320,6 +401,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
 const struct ra_hwdec_driver ra_hwdec_vulkan = {
     .name = "vulkan",
     .imgfmts = {IMGFMT_VULKAN, 0},
+    .device_type = AV_HWDEVICE_TYPE_VULKAN,
     .priv_size = sizeof(struct vulkan_hw_priv),
     .init = vulkan_init,
     .uninit = vulkan_uninit,
@@ -329,5 +411,7 @@ const struct ra_hwdec_driver ra_hwdec_vulkan = {
         .uninit = mapper_uninit,
         .map = mapper_map,
         .unmap = mapper_unmap,
+        .begin_access = mapper_begin_access,
+        .end_access = mapper_end_access,
     },
 };

@@ -28,7 +28,7 @@
 #include <EGL/eglext.h>
 #include <drm_fourcc.h>
 
-#include "libmpv/render_gl.h"
+#include "mpv/render_gl.h"
 #include "common/common.h"
 #include "osdep/timer.h"
 #include "video/out/drm_atomic.h"
@@ -49,6 +49,7 @@
 
 struct gbm_frame {
     struct gbm_bo *bo;
+    struct pl_color_space color;
 };
 
 struct gbm {
@@ -70,15 +71,14 @@ struct priv {
     struct egl egl;
     struct gbm gbm;
 
-    GLsync *vsync_fences;
-    unsigned int num_vsync_fences;
-
     uint32_t gbm_format;
     uint64_t *gbm_modifiers;
     unsigned int num_gbm_modifiers;
 
     struct mpv_opengl_drm_params_v2 drm_params;
     struct mpv_opengl_drm_draw_surface_size draw_surface_size;
+
+    struct pl_color_space committed_color;
 };
 
 // Not general. Limited to only the formats being used in this module
@@ -218,6 +218,21 @@ static bool init_egl(struct ra_ctx *ctx)
     return true;
 }
 
+static struct gbm_surface *create_gbm_surface(struct ra_ctx *ctx,
+                                              const uint64_t *modifiers,
+                                              unsigned int num_modifiers)
+{
+    struct priv *p = ctx->priv;
+    return gbm_surface_create_with_modifiers2(
+        p->gbm.device,
+        p->draw_surface_size.width,
+        p->draw_surface_size.height,
+        p->gbm_format,
+        modifiers,
+        num_modifiers,
+        GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+}
+
 static bool init_gbm(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
@@ -231,21 +246,12 @@ static bool init_gbm(struct ra_ctx *ctx)
 
     MP_VERBOSE(ctx->vo, "Initializing GBM surface (%d x %d)\n",
         p->draw_surface_size.width, p->draw_surface_size.height);
-    if (p->num_gbm_modifiers == 0) {
-        p->gbm.surface = gbm_surface_create(
-            p->gbm.device,
-            p->draw_surface_size.width,
-            p->draw_surface_size.height,
-            p->gbm_format,
-            GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-    } else {
-        p->gbm.surface = gbm_surface_create_with_modifiers(
-            p->gbm.device,
-            p->draw_surface_size.width,
-            p->draw_surface_size.height,
-            p->gbm_format,
-            p->gbm_modifiers,
-            p->num_gbm_modifiers);
+    p->gbm.surface = create_gbm_surface(ctx, p->gbm_modifiers, p->num_gbm_modifiers);
+    // GBM may not support the modifiers the plane advertises.
+    if (!p->gbm.surface && p->num_gbm_modifiers) {
+        MP_VERBOSE(ctx->vo, "Failed to create GBM surface with explicit modifiers: %s\n",
+                   mp_strerror(errno));
+        p->gbm.surface = create_gbm_surface(ctx, NULL, 0);
     }
     if (!p->gbm.surface) {
         MP_ERR(ctx->vo, "Failed to create GBM surface.\n");
@@ -278,36 +284,32 @@ static void update_framebuffer_from_bo(struct ra_ctx *ctx, struct gbm_bo *bo)
     fb->height = gbm_bo_get_height(bo);
     uint64_t modifier = gbm_bo_get_modifier(bo);
 
-    int ret;
-    if (p->num_gbm_modifiers == 0 || modifier == DRM_FORMAT_MOD_INVALID) {
-        uint32_t stride = gbm_bo_get_stride(bo);
-        uint32_t handle = gbm_bo_get_handle(bo).u32;
-        ret = drmModeAddFB2(fb->fd, fb->width, fb->height,
-                            p->gbm_format,
-                            (uint32_t[4]){handle, 0, 0, 0},
-                            (uint32_t[4]){stride, 0, 0, 0},
-                            (uint32_t[4]){0, 0, 0, 0},
-                            &fb->id, 0);
-    } else {
+    uint32_t handles[4] = {0};
+    uint32_t strides[4] = {0};
+    uint32_t offsets[4] = {0};
+    uint64_t modifiers[4] = {0};
+    uint32_t flags = 0;
+
+    const int num_planes = gbm_bo_get_plane_count(bo);
+    for (int i = 0; i < num_planes; ++i) {
+        handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
+        strides[i] = gbm_bo_get_stride_for_plane(bo, i);
+        offsets[i] = gbm_bo_get_offset(bo, i);
+        modifiers[i] = modifier;
+    }
+
+    if (modifier && modifier != DRM_FORMAT_MOD_INVALID) {
         MP_VERBOSE(ctx, "GBM surface using modifier 0x%"PRIX64"\n", modifier);
+        flags = DRM_MODE_FB_MODIFIERS;
+    }
 
-        uint32_t handles[4] = {0};
-        uint32_t strides[4] = {0};
-        uint32_t offsets[4] = {0};
-        uint64_t modifiers[4] = {0};
-
-        const int num_planes = gbm_bo_get_plane_count(bo);
-        for (int i = 0; i < num_planes; ++i) {
-            handles[i] = gbm_bo_get_handle_for_plane(bo, i).u32;
-            strides[i] = gbm_bo_get_stride_for_plane(bo, i);
-            offsets[i] = gbm_bo_get_offset(bo, i);
-            modifiers[i] = modifier;
-        }
-
-        ret = drmModeAddFB2WithModifiers(fb->fd, fb->width, fb->height,
+    int ret = drmModeAddFB2WithModifiers(fb->fd, fb->width, fb->height,
                                          p->gbm_format,
                                          handles, strides, offsets, modifiers,
-                                         &fb->id, DRM_MODE_FB_MODIFIERS);
+                                         &fb->id, flags);
+    if (ret) {
+        ret = drmModeAddFB2(fb->fd, fb->width, fb->height, p->gbm_format,
+                            handles, strides, offsets, &fb->id, 0);
     }
     if (ret) {
         MP_ERR(ctx->vo, "Failed to create framebuffer: %s\n", mp_strerror(errno));
@@ -319,31 +321,42 @@ static void update_framebuffer_from_bo(struct ra_ctx *ctx, struct gbm_bo *bo)
 static void queue_flip(struct ra_ctx *ctx, struct gbm_frame *frame)
 {
     struct vo_drm_state *drm = ctx->vo->drm;
+    struct priv *p = ctx->priv;
 
     update_framebuffer_from_bo(ctx, frame->bo);
 
     struct drm_atomic_context *atomic_ctx = drm->atomic_context;
+    int flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
     drm_object_set_property(atomic_ctx->request, atomic_ctx->draw_plane, "FB_ID", drm->fb->id);
     drm_object_set_property(atomic_ctx->request, atomic_ctx->draw_plane, "CRTC_ID", atomic_ctx->crtc->id);
     drm_object_set_property(atomic_ctx->request, atomic_ctx->draw_plane, "ZPOS", 1);
 
-    int ret = drmModeAtomicCommit(drm->fd, atomic_ctx->request,
-                                  DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, drm);
-
-    if (ret)
+    bool set_color = !pl_color_space_equal(&frame->color, &p->committed_color);
+    if (set_color) {
+        vo_drm_set_colorspace_blob(ctx->vo, &frame->color);
+        flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+    }
+    int ret = drmModeAtomicCommit(drm->fd, atomic_ctx->request, flags, drm);
+    if (ret) {
         MP_WARN(ctx->vo, "Failed to commit atomic request: %s\n", mp_strerror(ret));
+        if (set_color)
+            frame->color = p->committed_color;
+    }
+
     drm->waiting_for_flip = !ret;
+    p->committed_color = !ret ? frame->color : p->committed_color;
 
     drmModeAtomicFree(atomic_ctx->request);
     atomic_ctx->request = drmModeAtomicAlloc();
 }
 
-static void enqueue_bo(struct ra_ctx *ctx, struct gbm_bo *bo)
+static void enqueue_bo(struct ra_ctx *ctx, struct gbm_bo *bo, struct pl_color_space color)
 {
     struct priv *p = ctx->priv;
 
-    struct gbm_frame *new_frame = talloc(p, struct gbm_frame);
+    struct gbm_frame *new_frame = talloc_zero(p, struct gbm_frame);
     new_frame->bo = bo;
+    new_frame->color = color;
     MP_TARRAY_APPEND(p, p->gbm.bo_queue, p->gbm.num_bos, new_frame);
 }
 
@@ -367,31 +380,8 @@ static void swapchain_step(struct ra_ctx *ctx)
     dequeue_bo(ctx);
 }
 
-static void new_fence(struct ra_ctx *ctx)
+static void drm_egl_swap_buffers(struct ra_ctx *ctx)
 {
-    struct priv *p = ctx->priv;
-
-    if (p->gl.FenceSync) {
-        GLsync fence = p->gl.FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        if (fence)
-            MP_TARRAY_APPEND(p, p->vsync_fences, p->num_vsync_fences, fence);
-    }
-}
-
-static void wait_fence(struct ra_ctx *ctx)
-{
-    struct priv *p = ctx->priv;
-
-    while (p->num_vsync_fences && (p->num_vsync_fences >= p->gbm.num_bos)) {
-        p->gl.ClientWaitSync(p->vsync_fences[0], GL_SYNC_FLUSH_COMMANDS_BIT, 1e9);
-        p->gl.DeleteSync(p->vsync_fences[0]);
-        MP_TARRAY_REMOVE_AT(p->vsync_fences, p->num_vsync_fences, 0);
-    }
-}
-
-static bool drm_egl_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
-{
-    struct ra_ctx *ctx = sw->ctx;
     struct priv *p = ctx->priv;
     struct vo_drm_state *drm = ctx->vo->drm;
 
@@ -400,30 +390,8 @@ static bool drm_egl_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
         p->drm_params.atomic_request_ptr = &drm->atomic_context->request;
     }
 
-    return ra_gl_ctx_start_frame(sw, out_fbo);
-}
-
-static bool drm_egl_submit_frame(struct ra_swapchain *sw, const struct vo_frame *frame)
-{
-    struct ra_ctx *ctx = sw->ctx;
-    struct vo_drm_state *drm = ctx->vo->drm;
-
-    drm->still = frame->still;
-
-    return ra_gl_ctx_submit_frame(sw, frame);
-}
-
-static void drm_egl_swap_buffers(struct ra_swapchain *sw)
-{
-    struct ra_ctx *ctx = sw->ctx;
-    struct priv *p = ctx->priv;
-    struct vo_drm_state *drm = ctx->vo->drm;
-    const bool drain = drm->paused || drm->still;  // True when we need to drain the swapchain
-
     if (!drm->active)
         return;
-
-    wait_fence(ctx);
 
     eglSwapBuffers(p->egl.display, p->egl.surface);
 
@@ -432,10 +400,9 @@ static void drm_egl_swap_buffers(struct ra_swapchain *sw)
         MP_ERR(ctx->vo, "Couldn't lock front buffer\n");
         return;
     }
-    enqueue_bo(ctx, new_bo);
-    new_fence(ctx);
+    enqueue_bo(ctx, new_bo, drm->colorspace);
 
-    while (drain || p->gbm.num_bos > ctx->vo->opts->swapchain_depth ||
+    while (drm->redraw || p->gbm.num_bos > ctx->vo->opts->swapchain_depth ||
            !gbm_surface_has_free_buffers(p->gbm.surface)) {
         if (drm->waiting_for_flip) {
             vo_drm_wait_on_flip(drm);
@@ -450,28 +417,12 @@ static void drm_egl_swap_buffers(struct ra_swapchain *sw)
         }
         queue_flip(ctx, p->gbm.bo_queue[1]);
     }
+    drm->redraw = false;
 }
-
-static const struct ra_swapchain_fns drm_egl_swapchain = {
-    .start_frame   = drm_egl_start_frame,
-    .submit_frame  = drm_egl_submit_frame,
-    .swap_buffers  = drm_egl_swap_buffers,
-};
 
 static void drm_egl_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
-    struct vo_drm_state *drm = ctx->vo->drm;
-    if (drm) {
-        struct drm_atomic_context *atomic_ctx = drm->atomic_context;
-
-        if (drmModeAtomicCommit(drm->fd, atomic_ctx->request, 0, NULL))
-            MP_ERR(ctx->vo, "Failed to commit atomic request: %s\n",
-                    mp_strerror(errno));
-
-        drmModeAtomicFree(atomic_ctx->request);
-    }
-
     ra_gl_ctx_uninit(ctx);
     vo_drm_uninit(ctx->vo);
 
@@ -582,12 +533,51 @@ static void drm_egl_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
     present_sync_get_info(drm->present, info);
 }
 
+static pl_color_space_t drm_egl_preferred_csp(struct ra_ctx *ctx)
+{
+    struct vo_drm_state *drm = ctx->vo->drm;
+    pl_color_space_t bt2020 = {0};
+
+    // If the display supports either one of these colorspaces, return it as
+    // preferred.
+    if (vo_drm_color_supported_by_display(drm, pl_color_space_hdr10)) {
+        bt2020 = pl_color_space_hdr10;
+    } else if (vo_drm_color_supported_by_display(drm, pl_color_space_bt2020_hlg)) {
+        bt2020 = pl_color_space_bt2020_hlg;
+    }
+
+    if (bt2020.primaries != PL_COLOR_PRIM_UNKNOWN) {
+        bt2020.hdr.prim.red.x = drm->chromaticity->red_x;
+        bt2020.hdr.prim.red.y = drm->chromaticity->red_y;
+        bt2020.hdr.prim.green.x = drm->chromaticity->green_x;
+        bt2020.hdr.prim.green.y = drm->chromaticity->green_y;
+        bt2020.hdr.prim.blue.x = drm->chromaticity->blue_x;
+        bt2020.hdr.prim.blue.y = drm->chromaticity->blue_y;
+        bt2020.hdr.prim.white.x = drm->chromaticity->white_x;
+        bt2020.hdr.prim.white.y = drm->chromaticity->white_y;
+        bt2020.hdr.min_luma = drm->hdr_static_metadata->desired_content_min_luminance;
+        bt2020.hdr.max_luma = drm->hdr_static_metadata->desired_content_max_luminance;
+        return bt2020;
+    }
+
+    return pl_color_space_srgb;
+}
+
+static bool drm_egl_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+{
+    struct pl_color_space sdr = pl_color_space_srgb;
+    vo_drm_set_color(ctx->vo, params ? &params->color : &sdr);
+    return true;
+}
+
 static bool drm_egl_init(struct ra_ctx *ctx)
 {
     if (!vo_drm_init(ctx->vo))
         goto err;
 
     struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+    p->drm_params.fd = -1;
+    p->drm_params.render_fd = -1;
     struct vo_drm_state *drm = ctx->vo->drm;
 
     if (ctx->vo->drm->opts->draw_surface_size.wh_valid) {
@@ -615,6 +605,10 @@ static bool drm_egl_init(struct ra_ctx *ctx)
     case DRM_OPTS_FORMAT_XBGR8888:
         argb_format = GBM_FORMAT_ABGR8888;
         xrgb_format = GBM_FORMAT_XBGR8888;
+        break;
+    case DRM_OPTS_FORMAT_RGB565:
+        argb_format = GBM_FORMAT_RGB565;
+        xrgb_format = GBM_FORMAT_RGB565;
         break;
     default:
         if (drm->opts->drm_format != DRM_OPTS_FORMAT_XRGB8888) {
@@ -662,7 +656,7 @@ static bool drm_egl_init(struct ra_ctx *ctx)
         goto err;
     }
 
-    enqueue_bo(ctx, new_bo);
+    enqueue_bo(ctx, new_bo, pl_color_space_srgb);
     update_framebuffer_from_bo(ctx, new_bo);
     if (!drm->fb || !drm->fb->id) {
         MP_ERR(ctx, "Failed to create framebuffer.\n");
@@ -694,9 +688,11 @@ static bool drm_egl_init(struct ra_ctx *ctx)
         MP_VERBOSE(ctx, "Could not find path to render node.\n");
     }
 
-    struct ra_gl_ctx_params params = {
-        .external_swapchain = &drm_egl_swapchain,
-        .get_vsync          = &drm_egl_get_vsync,
+    struct ra_ctx_params params = {
+        .get_vsync          = drm_egl_get_vsync,
+        .preferred_csp      = drm_egl_preferred_csp,
+        .set_color          = drm_egl_set_color,
+        .swap_buffers       = drm_egl_swap_buffers,
     };
     if (!ra_gl_ctx_init(ctx, &p->gl, params))
         goto err;
@@ -738,13 +734,13 @@ static void drm_egl_wakeup(struct ra_ctx *ctx)
 }
 
 const struct ra_ctx_fns ra_ctx_drm_egl = {
-    .type           = "opengl",
-    .name           = "drm",
-    .description    = "DRM/EGL",
-    .reconfig       = drm_egl_reconfig,
-    .control        = drm_egl_control,
-    .init           = drm_egl_init,
-    .uninit         = drm_egl_uninit,
-    .wait_events    = drm_egl_wait_events,
-    .wakeup         = drm_egl_wakeup,
+    .type            = "opengl",
+    .name            = "drm",
+    .description     = "DRM/EGL",
+    .reconfig        = drm_egl_reconfig,
+    .control         = drm_egl_control,
+    .init            = drm_egl_init,
+    .uninit          = drm_egl_uninit,
+    .wait_events     = drm_egl_wait_events,
+    .wakeup          = drm_egl_wakeup,
 };

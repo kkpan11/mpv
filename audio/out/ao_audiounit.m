@@ -97,7 +97,7 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
     int64_t end = mp_time_ns();
     end += MP_TIME_S_TO_NS(p->device_latency);
     end += ca_get_latency(ts) + ca_frames_to_ns(ao, frames);
-    ao_read_data(ao, planes, frames, end);
+    ao_read_data(ao, planes, frames, end, NULL, true, true);
     return noErr;
 }
 
@@ -115,7 +115,12 @@ static bool init_audiounit(struct ao *ao)
 
     MP_VERBOSE(ao, "max channels: %ld, requested: %d\n", maxChannels, (int)ao->channels.num);
 
-    [instance setCategory:AVAudioSessionCategoryPlayback error:nil];
+    AVAudioSessionCategoryOptions options = 0;
+    if (!(ao->init_flags & AO_INIT_EXCLUSIVE)) {
+        options |= AVAudioSessionCategoryOptionMixWithOthers;
+    }
+
+    [instance setCategory:AVAudioSessionCategoryPlayback withOptions:options error:nil];
     [instance setMode:AVAudioSessionModeMoviePlayback error:nil];
     [instance setActive:YES error:nil];
     [instance setPreferredOutputNumberOfChannels:prefChannels error:nil];
@@ -158,14 +163,16 @@ static bool init_audiounit(struct ao *ao)
         MP_VERBOSE(ao, "channel map: %i: %u\n", i, layout->mChannelDescriptions[i].mChannelLabel);
     }
 
-    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2) {
+    if (af_fmt_is_spdif(ao->format) || instance.outputNumberOfChannels <= 2 ||
+        layout->mNumberChannelDescriptions > MP_NUM_CHANNELS)
+    {
         ao->channels = (struct mp_chmap)MP_CHMAP_INIT_STEREO;
         MP_VERBOSE(ao, "using stereo output\n");
     } else {
         ao->channels.num = (uint8_t)layout->mNumberChannelDescriptions;
         for (UInt32 i = 0; i < layout->mNumberChannelDescriptions; i++) {
-          ao->channels.speaker[i] =
-              ca_label_to_mp_speaker_id(layout->mChannelDescriptions[i].mChannelLabel);
+            int speaker = ca_label_to_mp_speaker_id(layout->mChannelDescriptions[i].mChannelLabel);
+            ao->channels.speaker[i] = speaker < 0 ? MP_SPEAKER_ID_NA : speaker;
         }
         MP_VERBOSE(ao, "using standard channel mapping\n");
     }

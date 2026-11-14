@@ -342,7 +342,7 @@ static const float SLOG_A = 0.432699,
 // absolute scale, multiply the result by `pl_color_transfer_nominal_peak(trc)`
 void pass_linearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
 {
-    if (trc == PL_COLOR_TRC_LINEAR)
+    if (trc == PL_COLOR_TRC_LINEAR || trc == PL_COLOR_TRC_SCRGB)
         return;
 
     GLSLF("// linearize\n");
@@ -413,9 +413,11 @@ void pass_linearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
               VLOG_D, VLOG_C, VLOG_B, gl_sc_bvec(sc, 3));
         break;
     case PL_COLOR_TRC_S_LOG1:
-        GLSLF("color.rgb = pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f))\n"
-              "            - vec3(%f);\n",
-              SLOG_C, SLOG_A, SLOG_B);
+        GLSLF("color.rgb = mix((color.rgb - vec3(%f)) * vec3(1.0/5.0),    \n"
+              "    pow(vec3(10.0), (color.rgb - vec3(%f)) * vec3(1.0/%f)) \n"
+              "        - vec3(%f),                                        \n"
+              "    %s(lessThanEqual(vec3(%f), color.rgb)));               \n",
+              SLOG_Q, SLOG_C, SLOG_A, SLOG_B, gl_sc_bvec(sc, 3), SLOG_Q);
         break;
     case PL_COLOR_TRC_S_LOG2:
         GLSLF("color.rgb = mix((color.rgb - vec3(%f)) * vec3(1.0/%f),      \n"
@@ -442,7 +444,7 @@ void pass_linearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
 // Like pass_linearize, this functions ingests values on an normalized scale
 void pass_delinearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
 {
-    if (trc == PL_COLOR_TRC_LINEAR)
+    if (trc == PL_COLOR_TRC_LINEAR || trc == PL_COLOR_TRC_SCRGB)
         return;
 
     GLSLF("// delinearize\n");
@@ -479,9 +481,9 @@ void pass_delinearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
         GLSL(color.rgb = pow(color.rgb, vec3(1.0/2.8));)
         break;
     case PL_COLOR_TRC_PRO_PHOTO:
-        GLSLF("color.rgb = mix(color.rgb * vec3(16.0),                        \n"
-              "                pow(color.rgb, vec3(1.0/1.8)),                 \n"
-              "                %s(lessThanEqual(vec3(0.001953), color.rgb))); \n",
+        GLSLF("color.rgb = mix(color.rgb * vec3(16.0),                           \n"
+              "                pow(color.rgb, vec3(1.0/1.8)),                    \n"
+              "                %s(lessThanEqual(vec3(0.001953125), color.rgb))); \n",
               gl_sc_bvec(sc, 3));
         break;
     case PL_COLOR_TRC_PQ:
@@ -507,8 +509,10 @@ void pass_delinearize(struct gl_shader_cache *sc, enum pl_color_transfer trc)
               VLOG_C / M_LN10, VLOG_B, VLOG_D, gl_sc_bvec(sc, 3));
         break;
     case PL_COLOR_TRC_S_LOG1:
-        GLSLF("color.rgb = vec3(%f) * log(color.rgb + vec3(%f)) + vec3(%f);\n",
-              SLOG_A / M_LN10, SLOG_B, SLOG_C);
+        GLSLF("color.rgb = mix(vec3(5.0) * color.rgb + vec3(%f),               \n"
+              "                vec3(%f) * log(color.rgb + vec3(%f)) + vec3(%f), \n"
+              "                %s(lessThanEqual(vec3(0.0), color.rgb)));       \n",
+              SLOG_Q, SLOG_A / M_LN10, SLOG_B, SLOG_C, gl_sc_bvec(sc, 3));
         break;
     case PL_COLOR_TRC_S_LOG2:
         GLSLF("color.rgb = mix(vec3(%f) * color.rgb + vec3(%f),                \n"
@@ -539,9 +543,12 @@ static void pass_ootf(struct gl_shader_cache *sc, enum mp_csp_light light,
     switch (light)
     {
     case MP_CSP_LIGHT_SCENE_HLG: {
-        // HLG OOTF from BT.2100, scaled to the chosen display peak
-        float gamma = MPMAX(1.0, 1.2 + 0.42 * log10(peak * MP_REF_WHITE / 1000.0));
-        GLSLF("color.rgb *= vec3(%f * pow(dot(src_luma, color.rgb), %f));\n",
+        // HLG OOTF from BT.2100, scaled to the chosen display peak, with the
+        // extended range system gamma of BT.2100-3 note 5f for every peak.
+        // The luma is floored because the gamma drops below 1 for dim
+        // displays, where the power of a zero luma is infinite.
+        float gamma = 1.2 * pow(1.111, log2(peak * MP_REF_WHITE / 1000.0));
+        GLSLF("color.rgb *= vec3(%f * pow(max(dot(src_luma, color.rgb), 1e-6), %f));\n",
               peak / pow(12.0 / MP_REF_WHITE_HLG, gamma), gamma - 1.0);
         break;
     }
@@ -575,9 +582,9 @@ static void pass_inverse_ootf(struct gl_shader_cache *sc, enum mp_csp_light ligh
     switch (light)
     {
     case MP_CSP_LIGHT_SCENE_HLG: {
-        float gamma = MPMAX(1.0, 1.2 + 0.42 * log10(peak * MP_REF_WHITE / 1000.0));
+        float gamma = 1.2 * pow(1.111, log2(peak * MP_REF_WHITE / 1000.0));
         GLSLF("color.rgb *= vec3(1.0/%f);\n", peak / pow(12.0 / MP_REF_WHITE_HLG, gamma));
-        GLSLF("color.rgb /= vec3(max(1e-6, pow(dot(src_luma, color.rgb), %f)));\n",
+        GLSLF("color.rgb /= vec3(pow(max(dot(src_luma, color.rgb), 1e-6), %f));\n",
               (gamma - 1.0) / gamma);
         break;
     }
@@ -836,7 +843,7 @@ static void pass_tone_map(struct gl_shader_cache *sc,
 // the caller to have already bound the appropriate SSBO and set up the compute
 // shader metadata
 void pass_color_map(struct gl_shader_cache *sc, bool is_linear,
-                    struct pl_color_space src, struct pl_color_space dst,
+                    const struct pl_color_space *src, const struct pl_color_space *dst,
                     enum mp_csp_light src_light, enum mp_csp_light dst_light,
                     const struct gl_tone_map_opts *opts)
 {
@@ -844,45 +851,45 @@ void pass_color_map(struct gl_shader_cache *sc, bool is_linear,
 
     // Some operations need access to the video's luma coefficients, so make
     // them available
-    pl_matrix3x3 rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(src.primaries));
+    pl_matrix3x3 rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(src->primaries));
     gl_sc_uniform_vec3(sc, "src_luma", rgb2xyz.m[1]);
-    rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(dst.primaries));
+    rgb2xyz = pl_get_rgb2xyz_matrix(pl_raw_primaries_get(dst->primaries));
     gl_sc_uniform_vec3(sc, "dst_luma", rgb2xyz.m[1]);
 
     bool need_ootf = src_light != dst_light;
-    if (src_light == MP_CSP_LIGHT_SCENE_HLG && src.hdr.max_luma != dst.hdr.max_luma)
+    if (src_light == MP_CSP_LIGHT_SCENE_HLG && src->hdr.max_luma != dst->hdr.max_luma)
         need_ootf = true;
 
     // All operations from here on require linear light as a starting point,
-    // so we linearize even if src.gamma == dst.transfer when one of the other
+    // so we linearize even if src->gamma == dst->transfer when one of the other
     // operations needs it
-    bool need_linear = src.transfer != dst.transfer ||
-                       src.primaries != dst.primaries ||
-                       src.hdr.max_luma != dst.hdr.max_luma ||
+    bool need_linear = src->transfer != dst->transfer ||
+                       src->primaries != dst->primaries ||
+                       src->hdr.max_luma != dst->hdr.max_luma ||
                        need_ootf;
 
     if (need_linear && !is_linear) {
         // We also pull it up so that 1.0 is the reference white
-        pass_linearize(sc, src.transfer);
+        pass_linearize(sc, src->transfer);
         is_linear = true;
     }
 
     // Pre-scale the incoming values into an absolute scale
-    GLSLF("color.rgb *= vec3(%f);\n", pl_color_transfer_nominal_peak(src.transfer));
+    GLSLF("color.rgb *= vec3(%f);\n", pl_color_transfer_nominal_peak(src->transfer));
 
     if (need_ootf)
-        pass_ootf(sc, src_light, src.hdr.max_luma / MP_REF_WHITE);
+        pass_ootf(sc, src_light, src->hdr.max_luma / MP_REF_WHITE);
 
     // Tone map to prevent clipping due to excessive brightness
-    if (src.hdr.max_luma > dst.hdr.max_luma) {
-        pass_tone_map(sc, src.hdr.max_luma / MP_REF_WHITE,
-                      dst.hdr.max_luma / MP_REF_WHITE, opts);
+    if (src->hdr.max_luma > dst->hdr.max_luma) {
+        pass_tone_map(sc, src->hdr.max_luma / MP_REF_WHITE,
+                      dst->hdr.max_luma / MP_REF_WHITE, opts);
     }
 
     // Adapt to the right colorspace if necessary
-    if (src.primaries != dst.primaries) {
-        const struct pl_raw_primaries *csp_src = pl_raw_primaries_get(src.primaries),
-                                      *csp_dst = pl_raw_primaries_get(dst.primaries);
+    if (src->primaries != dst->primaries) {
+        const struct pl_raw_primaries *csp_src = pl_raw_primaries_get(src->primaries),
+                                      *csp_dst = pl_raw_primaries_get(dst->primaries);
         pl_matrix3x3 m = pl_get_color_mapping_matrix(csp_src, csp_dst,
                                                      PL_INTENT_RELATIVE_COLORIMETRIC);
         gl_sc_uniform_mat3(sc, "cms_matrix", true, &m.m[0][0]);
@@ -896,20 +903,20 @@ void pass_color_map(struct gl_shader_cache *sc, bool is_linear,
                      color.rgb = mix(color.rgb, vec3(luma), coeff);
                  })
             GLSLF("float cmax = 1.0/%f * max(max(color.r, color.g), color.b);\n",
-                  dst.hdr.max_luma / MP_REF_WHITE);
+                  dst->hdr.max_luma / MP_REF_WHITE);
             GLSL(if (cmax > 1.0) color.rgb /= cmax;)
         }
     }
 
     if (need_ootf)
-        pass_inverse_ootf(sc, dst_light, dst.hdr.max_luma / MP_REF_WHITE);
+        pass_inverse_ootf(sc, dst_light, dst->hdr.max_luma / MP_REF_WHITE);
 
     // Post-scale the outgoing values from absolute scale to normalized.
     // For SDR, we normalize to the chosen signal peak. For HDR, we normalize
     // to the encoding range of the transfer function.
-    float dst_range = dst.hdr.max_luma / MP_REF_WHITE;
-    if (pl_color_space_is_hdr(&dst))
-        dst_range = pl_color_transfer_nominal_peak(dst.transfer);
+    float dst_range = dst->hdr.max_luma / MP_REF_WHITE;
+    if (pl_color_space_is_hdr(dst))
+        dst_range = pl_color_transfer_nominal_peak(dst->transfer);
 
     GLSLF("color.rgb *= vec3(%f);\n", 1.0 / dst_range);
 
@@ -921,7 +928,7 @@ void pass_color_map(struct gl_shader_cache *sc, bool is_linear,
     }
 
     if (is_linear)
-        pass_delinearize(sc, dst.transfer);
+        pass_delinearize(sc, dst->transfer);
 }
 
 // Wide usage friendly PRNG, shamelessly stolen from a GLSL tricks forum post.

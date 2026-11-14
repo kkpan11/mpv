@@ -48,14 +48,19 @@ static const m_option_t style_opts[] = {
     {"font", OPT_STRING(font)},
     {"font-size", OPT_FLOAT(font_size), M_RANGE(1, 9000)},
     {"color", OPT_COLOR(color)},
-    {"border-color", OPT_COLOR(border_color)},
-    {"shadow-color", OPT_COLOR(shadow_color)},
+    {"outline-color", OPT_COLOR(outline_color)},
     {"back-color", OPT_COLOR(back_color)},
-    {"border-size", OPT_FLOAT(border_size)},
+    {"outline-size", OPT_FLOAT(outline_size)},
+    {"border-color", OPT_ALIAS("outline-color"), .alias_use_prefix = true},
+    {"shadow-color", OPT_ALIAS("back-color"), .alias_use_prefix = true},
+    {"border-style", OPT_CHOICE(border_style,
+        {"outline-and-shadow", 1}, {"opaque-box", 3}, {"background-box", 4})},
+    {"border-size", OPT_ALIAS("outline-size"), .alias_use_prefix = true},
     {"shadow-offset", OPT_FLOAT(shadow_offset)},
     {"spacing", OPT_FLOAT(spacing), M_RANGE(-10, 10)},
-    {"margin-x", OPT_INT(margin_x), M_RANGE(0, 300)},
-    {"margin-y", OPT_INT(margin_y), M_RANGE(0, 600)},
+    {"margin-x", OPT_INT(margin_x), M_RANGE(0, INT_MAX)},
+    {"margin-y", OPT_INT(margin_y), M_RANGE(0, INT_MAX)},
+    {"margin-y-offset", OPT_INT(margin_y_offset)},
     {"align-x", OPT_CHOICE(align_x,
         {"left", -1}, {"center", 0}, {"right", +1})},
     {"align-y", OPT_CHOICE(align_y,
@@ -77,14 +82,15 @@ const struct m_sub_options osd_style_conf = {
     .size = sizeof(struct osd_style_opts),
     .defaults = &(const struct osd_style_opts){
         .font = "sans-serif",
-        .font_size = 55,
+        .font_size = 30,
         .color = {255, 255, 255, 255},
-        .border_color = {0, 0, 0, 255},
-        .shadow_color = {240, 240, 240, 128},
-        .border_size = 3,
+        .outline_color = {0, 0, 0, 255},
+        .back_color = {0, 0, 0, 175},
+        .border_style = 1,
+        .outline_size = 1.65,
         .shadow_offset = 0,
-        .margin_x = 25,
-        .margin_y = 22,
+        .margin_x = 16,
+        .margin_y = 16,
         .align_x = -1,
         .align_y = -1,
     },
@@ -96,16 +102,48 @@ const struct m_sub_options sub_style_conf = {
     .size = sizeof(struct osd_style_opts),
     .defaults = &(const struct osd_style_opts){
         .font = "sans-serif",
-        .font_size = 55,
+        .font_size = 38,
         .color = {255, 255, 255, 255},
-        .border_color = {0, 0, 0, 255},
-        .shadow_color = {240, 240, 240, 128},
-        .border_size = 3,
+        .outline_color = {0, 0, 0, 255},
+        .back_color = {0, 0, 0, 175},
+        .border_style = 1,
+        .outline_size = 1.65,
         .shadow_offset = 0,
-        .margin_x = 25,
-        .margin_y = 22,
+        .margin_x = 19,
+        .margin_y = 34,
         .align_x = 0,
         .align_y = 1,
+    },
+    .change_flags = UPDATE_OSD,
+};
+
+#undef OPT_BASE_STRUCT
+#define OPT_BASE_STRUCT struct osd_bar_style_opts
+static const m_option_t bar_style_opts[] = {
+    {"align-x", OPT_FLOAT(align_x), M_RANGE(-1.0, +1.0)},
+    {"align-y", OPT_FLOAT(align_y), M_RANGE(-1.0, +1.0)},
+    {"w", OPT_FLOAT(w), M_RANGE(1, 100)},
+    {"h", OPT_FLOAT(h), M_RANGE(0.1, 50)},
+    {"outline-size", OPT_FLOAT(outline_size), M_RANGE(0, 1000.0)},
+    {"border-size", OPT_ALIAS("osd-bar-outline-size")},
+    {"marker-scale", OPT_FLOAT(marker_scale), M_RANGE(0, 100.0)},
+    {"marker-min-size", OPT_FLOAT(marker_min_size), M_RANGE(0, 1000.0)},
+    {"marker-style", OPT_CHOICE(marker_style,
+        {"none", 0}, {"triangle", 1}, {"line", 2})},
+    {0}
+};
+
+const struct m_sub_options osd_bar_style_conf = {
+    .opts = bar_style_opts,
+    .size = sizeof(struct osd_bar_style_opts),
+    .defaults = &(const struct osd_bar_style_opts){
+        .align_y = 0.5,
+        .w = 75.0,
+        .h = 3.125,
+        .outline_size = 0.5,
+        .marker_scale = 1.3,
+        .marker_min_size = 1.6,
+        .marker_style = 1,
     },
     .change_flags = UPDATE_OSD,
 };
@@ -146,7 +184,6 @@ struct osd_state *osd_create(struct mpv_global *global)
     osd->objs[OSDTYPE_SUB]->is_sub = true;
     osd->objs[OSDTYPE_SUB2]->is_sub = true;
 
-    osd_init_backend(osd);
     return osd;
 }
 
@@ -155,7 +192,8 @@ void osd_free(struct osd_state *osd)
     if (!osd)
         return;
     osd_destroy_backend(osd);
-    talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->external2);
+    talloc_free(osd->objs[OSDTYPE_EXTERNAL2]->image_overlay);
+    talloc_free(osd->objs[OSDTYPE_DISC_MENU]->image_overlay);
     mp_mutex_destroy(&osd->lock);
     talloc_free(osd);
 }
@@ -237,12 +275,12 @@ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
     mp_mutex_unlock(&osd->lock);
 }
 
-void osd_set_external2(struct osd_state *osd, struct sub_bitmaps *imgs)
+void osd_set_bitmaps(struct osd_state *osd, int type, struct sub_bitmaps *imgs)
 {
     mp_mutex_lock(&osd->lock);
-    struct osd_object *obj = osd->objs[OSDTYPE_EXTERNAL2];
-    talloc_free(obj->external2);
-    obj->external2 = sub_bitmaps_copy(NULL, imgs);
+    struct osd_object *obj = osd->objs[type];
+    talloc_free(obj->image_overlay);
+    obj->image_overlay = sub_bitmaps_copy(NULL, imgs);
     obj->vo_change_id += 1;
     osd->want_redraw_notification = true;
     mp_mutex_unlock(&osd->lock);
@@ -269,7 +307,8 @@ static void check_obj_resize(struct osd_state *osd, struct mp_osd_res res,
 void osd_resize(struct osd_state *osd, struct mp_osd_res res)
 {
     mp_mutex_lock(&osd->lock);
-    int types[] = {OSDTYPE_OSD, OSDTYPE_EXTERNAL, OSDTYPE_EXTERNAL2, -1};
+    int types[] = {OSDTYPE_OSD, OSDTYPE_EXTERNAL, OSDTYPE_EXTERNAL2,
+                   OSDTYPE_DISC_MENU, -1};
     for (int n = 0; types[n] >= 0; n++)
         check_obj_resize(osd, res, osd->objs[types[n]]);
     mp_mutex_unlock(&osd->lock);
@@ -294,10 +333,11 @@ static struct sub_bitmaps *render_object(struct osd_state *osd,
     } else if (obj->type == OSDTYPE_SUB2) {
         if (obj->sub && sub_is_secondary_visible(obj->sub))
             res = sub_get_bitmaps(obj->sub, obj->vo_res, format, video_pts);
-    } else if (obj->type == OSDTYPE_EXTERNAL2) {
-        if (obj->external2 && obj->external2->format) {
-            res = sub_bitmaps_copy(NULL, obj->external2); // need to be owner
-            obj->external2->change_id = 0;
+    } else if (obj->type == OSDTYPE_EXTERNAL2 ||
+               obj->type == OSDTYPE_DISC_MENU) {
+        if (obj->image_overlay && obj->image_overlay->format) {
+            res = sub_bitmaps_copy(NULL, obj->image_overlay); // need to be owner
+            obj->image_overlay->change_id = 0;
         }
     } else {
         res = osd_object_get_bitmaps(osd, obj, format);
@@ -327,6 +367,8 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
                                    const bool formats[SUBBITMAP_COUNT])
 {
     mp_mutex_lock(&osd->lock);
+
+    int64_t start_time = mp_time_ns();
 
     struct sub_bitmap_list *list = talloc_zero(NULL, struct sub_bitmap_list);
     list->change_id = 1;
@@ -376,12 +418,10 @@ struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
         talloc_free(imgs);
     }
 
-    // If this is called with OSD_DRAW_SUB_ONLY or OSD_DRAW_OSD_ONLY set, assume
-    // it will always draw the complete OSD by doing multiple osd_draw() calls.
-    // OSD_DRAW_SUB_FILTER on the other hand is an evil special-case, and we
-    // must not reset the flag when it happens.
-    if (!(draw_flags & OSD_DRAW_SUB_FILTER))
-        osd->want_redraw_notification = false;
+    double elapsed = MP_TIME_NS_TO_MS(mp_time_ns() - start_time);
+    bool slow = elapsed > 5;
+    mp_msg(osd->log, slow ? MSGL_DEBUG : MSGL_TRACE, "Spent %.3f ms in %s%s\n",
+           elapsed, __func__, slow ? " (slow!)" : "");
 
     mp_mutex_unlock(&osd->lock);
     return list;
@@ -497,7 +537,8 @@ struct mp_osd_res osd_get_vo_res(struct osd_state *osd)
 // fills the whole video area (especially if the video is magnified, e.g. on
 // fullscreen). If compensate_par is >0, adjust the way the subtitles are
 // "stretched" on the screen, and letter-box the result. If compensate_par
-// is <0, strictly letter-box the subtitles. If it is 0, stretch them.
+// is <0, strictly letter-box the subtitles according to the supplied aspect
+// ratio. If it is 0, stretch them.
 void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
                          struct mp_osd_res res, double compensate_par)
 {
@@ -506,8 +547,8 @@ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
     double xscale = (double)vidw / frame_w;
     double yscale = (double)vidh / frame_h;
     if (compensate_par < 0) {
-        assert(res.display_par);
-        compensate_par = xscale / yscale / res.display_par;
+        mp_assert(res.display_par);
+        compensate_par = xscale / yscale / res.display_par / compensate_par * -1;
     }
     if (compensate_par > 0)
         xscale /= compensate_par;
@@ -515,10 +556,16 @@ void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
     int cy = vidh / 2 - (int)(frame_h * yscale) / 2;
     for (int i = 0; i < imgs->num_parts; i++) {
         struct sub_bitmap *bi = &imgs->parts[i];
-        bi->x = (int)(bi->x * xscale) + cx + res.ml;
-        bi->y = (int)(bi->y * yscale) + cy + res.mt;
-        bi->dw = (int)(bi->w * xscale + 0.5);
-        bi->dh = (int)(bi->h * yscale + 0.5);
+        struct mp_rect rc = {
+            .x0 = lrint(bi->x * xscale),
+            .y0 = lrint(bi->y * yscale),
+            .x1 = lrint((bi->x + bi->w) * xscale),
+            .y1 = lrint((bi->y + bi->h) * yscale),
+        };
+        bi->x = rc.x0 + cx + res.ml;
+        bi->y = rc.y0 + cy + res.mt;
+        bi->dw = mp_rect_w(rc);
+        bi->dh = mp_rect_h(rc);
     }
 }
 
@@ -546,7 +593,7 @@ struct sub_bitmaps *sub_bitmaps_copy(struct sub_bitmap_copy_cache **p_cache,
 
     // The bitmaps being refcounted is essential for performance, and for
     // not invalidating in->parts[*].bitmap pointers.
-    assert(in->packed && in->packed->bufs[0]);
+    mp_assert(in->packed && in->packed->bufs[0]);
 
     res->packed = mp_image_new_ref(res->packed);
     talloc_steal(res, res->packed);

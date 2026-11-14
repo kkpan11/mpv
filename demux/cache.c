@@ -20,12 +20,12 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 #include "cache.h"
 #include "common/msg.h"
 #include "common/av_common.h"
 #include "demux.h"
+#include "demux/packet_pool.h"
 #include "misc/io_utils.h"
 #include "options/path.h"
 #include "options/m_config.h"
@@ -45,18 +45,18 @@ const struct m_sub_options demux_cache_conf = {
         {"demuxer-cache-unlink-files", OPT_CHOICE(unlink_files,
             {"immediate", 2}, {"whendone", 1}, {"no", 0}),
         },
-        {"cache-dir", OPT_REPLACED("demuxer-cache-dir")},
-        {"cache-unlink-files", OPT_REPLACED("demuxer-cache-unlink-files")},
         {0}
     },
     .size = sizeof(struct demux_cache_opts),
     .defaults = &(const struct demux_cache_opts){
         .unlink_files = 2,
     },
+    .change_flags = UPDATE_DEMUXER,
 };
 
 struct demux_cache {
     struct mp_log *log;
+    struct demux_packet_pool *packet_pool;
     struct demux_cache_opts *opts;
 
     char *filename;
@@ -100,6 +100,7 @@ struct demux_cache *demux_cache_create(struct mpv_global *global,
     talloc_set_destructor(cache, cache_destroy);
     cache->opts = mp_get_config_group(cache, global, &demux_cache_conf);
     cache->log = log;
+    cache->packet_pool = demux_packet_pool_get(global);
     cache->fd = -1;
 
     char *cache_dir = cache->opts->cache_dir;
@@ -115,6 +116,7 @@ struct demux_cache *demux_cache_create(struct mpv_global *global,
     mp_mkdirp(cache_dir);
     cache->filename = mp_path_join(cache, cache_dir, "mpv-cache-XXXXXX.dat");
     cache->fd = mp_mkostemps(cache->filename, 4, O_CLOEXEC);
+    talloc_free(cache_dir);
     if (cache->fd < 0) {
         MP_ERR(cache, "Failed to create cache temporary file.\n");
         goto fail;
@@ -204,7 +206,7 @@ static bool read_raw(struct demux_cache *cache, void *ptr, size_t len)
 // Returns a negative value on errors, i.e. writing the file failed.
 int64_t demux_cache_write(struct demux_cache *cache, struct demux_packet *dp)
 {
-    assert(dp->avpacket);
+    mp_assert(dp->avpacket);
 
     // AV_PKT_FLAG_TRUSTED usually means there are embedded pointers and such
     // in the packet data. The pointer will become invalid if the packet is
@@ -214,10 +216,11 @@ int64_t demux_cache_write(struct demux_cache *cache, struct demux_packet *dp)
         return -1;
     }
 
-    assert(!dp->is_cached);
-    assert(dp->len <= INT32_MAX);
-    assert(dp->avpacket->flags >= 0 && dp->avpacket->flags <= INT32_MAX);
-    assert(dp->avpacket->side_data_elems >= 0 &&
+    mp_assert(!dp->is_cached);
+    mp_assert(!dp->is_wrapped_avframe);
+    mp_assert(dp->len <= INT32_MAX);
+    mp_assert(dp->avpacket->flags >= 0 && dp->avpacket->flags <= INT32_MAX);
+    mp_assert(dp->avpacket->side_data_elems >= 0 &&
            dp->avpacket->side_data_elems <= INT32_MAX);
 
     if (!do_seek(cache, cache->file_size))
@@ -261,8 +264,8 @@ int64_t demux_cache_write(struct demux_cache *cache, struct demux_packet *dp)
     for (int n = 0; n < dp->avpacket->side_data_elems; n++) {
         AVPacketSideData *sd = &dp->avpacket->side_data[n];
 
-        assert(sd->size <= INT32_MAX);
-        assert(sd->type >= 0 && sd->type <= INT32_MAX);
+        mp_assert(sd->size <= INT32_MAX);
+        mp_assert(sd->type >= 0 && sd->type <= INT32_MAX);
 
         struct sd_header sd_hd = {
             .av_type = sd->type,
@@ -294,7 +297,7 @@ struct demux_packet *demux_cache_read(struct demux_cache *cache, uint64_t pos)
     if (!read_raw(cache, &hd, sizeof(hd)))
         return NULL;
 
-    struct demux_packet *dp = new_demux_packet(hd.data_len);
+    struct demux_packet *dp = new_demux_packet(cache->packet_pool, hd.data_len);
     if (!dp)
         goto fail;
 

@@ -25,7 +25,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 #include <stdbool.h>
 #include <math.h>
 #include <assert.h>
@@ -62,7 +61,7 @@ static bool is_fast_dr(GL *gl)
 
 static void GLAPIENTRY dummy_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
-    assert(framebuffer == 0);
+    mp_assert(framebuffer == 0);
 }
 
 #define FN_OFFS(name) offsetof(GL, name)
@@ -212,6 +211,26 @@ static const struct gl_functions gl_functions[] = {
         .ver_es_core = 300,
         .extension = "GL_EXT_unpack_subimage",
         .provides = MPGL_CAP_ROW_LENGTH,
+    },
+    // Framebuffers, alternative extension name. Some GL 2.1 drivers (e.g.
+    // Mesa lima) expose only this one. It provides a compatible subset of
+    // GL_ARB_framebuffer_object for our purposes; the entrypoints loaded
+    // here are overwritten by the ARB/core ones below if available.
+    {
+        .ver_exclude = 300,
+        .ver_es_exclude = 200, // FBOs are core in ES2
+        .extension = "GL_EXT_framebuffer_object",
+        .provides = MPGL_CAP_FB,
+        .functions = (const struct gl_function[]) {
+            DEF_FN_NAME(BindFramebuffer, "glBindFramebufferEXT"),
+            DEF_FN_NAME(GenFramebuffers, "glGenFramebuffersEXT"),
+            DEF_FN_NAME(DeleteFramebuffers, "glDeleteFramebuffersEXT"),
+            DEF_FN_NAME(CheckFramebufferStatus, "glCheckFramebufferStatusEXT"),
+            DEF_FN_NAME(FramebufferTexture2D, "glFramebufferTexture2DEXT"),
+            DEF_FN_NAME(GetFramebufferAttachmentParameteriv,
+                        "glGetFramebufferAttachmentParameterivEXT"),
+            {0}
+        },
     },
     // Framebuffers, extension in GL 2.x, core in GL 3.x core.
     {
@@ -626,7 +645,7 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
                 }
                 break;
             }
-            assert(i < MAX_FN_COUNT);
+            mp_assert(i < MAX_FN_COUNT);
             loaded[i] = ptr;
         }
 

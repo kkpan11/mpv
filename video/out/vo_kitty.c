@@ -20,7 +20,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <signal.h>
 
 #include "config.h"
 
@@ -37,6 +36,7 @@
 #include "options/m_config.h"
 #include "osdep/terminal.h"
 #include "sub/osd.h"
+#include "terminal_swapchain.h"
 #include "vo.h"
 #include "video/sws_utils.h"
 #include "video/mp_image.h"
@@ -48,39 +48,21 @@
 #define DEFAULT_WIDTH 80
 #define DEFAULT_HEIGHT 25
 
-static inline void write_str(const char *s)
-{
-    // On POSIX platforms, write() is the fastest method. It also is the only
-    // one that allows atomic writes so mpv’s output will not be interrupted
-    // by other processes or threads that write to stdout, which would cause
-    // screen corruption. POSIX does not guarantee atomicity for writes
-    // exceeding PIPE_BUF, but at least Linux does seem to implement it that
-    // way.
-#if HAVE_POSIX
-    int remain = strlen(s);
-    while (remain > 0) {
-        ssize_t written = write(STDOUT_FILENO, s, remain);
-        if (written < 0)
-            return;
-        remain -= written;
-        s += written;
-    }
-#else
-    printf("%s", s);
-    fflush(stdout);
-#endif
-}
-
 #define KITTY_ESC_IMG        "\033_Ga=T,f=24,s=%d,v=%d,C=1,q=2,m=1;"
-#define KITTY_ESC_IMG_SHM    "\033_Ga=T,t=s,f=24,s=%d,v=%d,C=1,q=2,m=1;%s\033\\"
+#define KITTY_ESC_IMG_SHM    "\033_Ga=T,t=s,f=24,s=%d,v=%d,C=1,q=2,m=1;%s"
 #define KITTY_ESC_CONTINUE   "\033_Gm=%d;"
-#define KITTY_ESC_END        "\033\\"
-#define KITTY_ESC_DELETE_ALL "\033_Ga=d;\033\\"
+static const bstr KITTY_ESC_END = bstr0_lit("\033\\");
+static const bstr KITTY_ESC_DELETE_ALL = bstr0_lit("\033_Ga=d;");
+
+static const bstr DCS_TMUX_PREFIX = bstr0_lit("\033Ptmux;\033");
+static const bstr DCS_SCREEN_PREFIX = bstr0_lit("\033P\033");
+static const bstr DCS_SUFFIX = bstr0_lit("\033\\");
 
 struct vo_kitty_opts {
     int width, height, top, left, rows, cols;
     bool config_clear, alt_screen;
     bool use_shm;
+    bool auto_multiplexer_passthrough;
 };
 
 struct priv {
@@ -91,6 +73,9 @@ struct priv {
     char    *shm_path, *shm_path_b64;
     int     buffer_size, output_size;
     int     shm_fd;
+    struct terminal_swapchain *swapchain;
+    bstr    dcs_prefix;
+    bstr    dcs_suffix;
 
     int left, top, width, height, cols, rows;
 
@@ -101,10 +86,27 @@ struct priv {
     struct mp_sws_context *sws;
 };
 
-#if HAVE_POSIX
-static struct sigaction saved_sigaction = {0};
-static bool resized;
-#endif
+
+static inline void append_passthrough(struct priv *p, bstr *bs, bstr append)
+{
+    bstr_xappend(NULL, bs, p->dcs_prefix);
+    bstr_xappend(NULL, bs, append);
+    bstr_xappend(NULL, bs, p->dcs_suffix);
+}
+
+MP_PRINTF_ATTRIBUTE(3, 4)
+static inline void append_asprintf_passthrough(struct priv *p, bstr *bs,
+                                                     const char *fmt, ...)
+{
+    bstr_xappend(NULL, bs, p->dcs_prefix);
+
+    va_list ap;
+    va_start(ap, fmt);
+    bstr_xappend_vasprintf(NULL, bs, fmt, ap);
+    va_end(ap);
+
+    bstr_xappend(NULL, bs, p->dcs_suffix);
+}
 
 static void close_shm(struct priv *p)
 {
@@ -129,6 +131,10 @@ static void free_bufs(struct vo* vo)
 
     if (p->opts.use_shm) {
         close_shm(p);
+#if HAVE_POSIX_SHM
+        if (p->shm_path)
+            shm_unlink(p->shm_path);
+#endif
     } else {
         talloc_free(p->buffer);
     }
@@ -159,12 +165,10 @@ static void set_out_params(struct vo *vo)
 
     p->width  = p->dst.x1 - p->dst.x0;
     p->height = p->dst.y1 - p->dst.y0;
-    p->top  = p->opts.top > 0 ?
-        p->opts.top : p->rows * p->dst.y0 / vo->dheight;
-    p->left = p->opts.left > 0 ?
-        p->opts.left : p->cols * p->dst.x0 / vo->dwidth;
+    p->top  = p->opts.top > 0 ? p->opts.top : 0;
+    p->left = p->opts.left > 0 ? p->opts.left : 0;
 
-    p->buffer_size = 3 * p->width * p->height;
+    p->buffer_size = 3 * vo->dwidth * vo->dheight;
     p->output_size = AV_BASE64_SIZE(p->buffer_size);
 }
 
@@ -173,9 +177,12 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct priv *p = vo->priv;
 
     vo->want_redraw = true;
-    write_str(KITTY_ESC_DELETE_ALL);
+
+    bstr *next = terminal_swapchain_next(p->swapchain);
+    append_passthrough(p, next, KITTY_ESC_DELETE_ALL);
+    append_passthrough(p, next, KITTY_ESC_END);
     if (p->opts.config_clear)
-        write_str(TERM_ESC_CLEAR_SCREEN);
+        bstr_xappend(NULL, next, (bstr)bstr0_lit(TERM_ESC_CLEAR_SCREEN));
 
     get_win_size(vo, &p->rows, &p->cols, &vo->dwidth, &vo->dheight);
     set_out_params(vo);
@@ -192,9 +199,10 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
         .p_h = 1,
     };
 
-    p->frame = mp_image_alloc(IMGFMT, p->width, p->height);
+    p->frame = mp_image_alloc(IMGFMT, vo->dwidth, vo->dheight);
     if (!p->frame)
         return -1;
+    mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
 
     if (mp_sws_reinit(p->sws) < 0)
         return -1;
@@ -239,22 +247,18 @@ static int create_shm(struct vo *vo)
 #endif
 }
 
-static void draw_frame(struct vo *vo, struct vo_frame *frame)
+static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     mp_image_t *mpi = NULL;
 
-#if !HAVE_POSIX
-    int prev_height = vo->dheight;
-    int prev_width = vo->dwidth;
-    get_win_size(vo, &p->rows, &p->cols, &vo->dwidth, &vo->dheight);
-    bool resized = (prev_width != vo->dwidth || prev_height != vo->dheight);
-#endif
-
-    if (resized)
-        reconfig(vo, vo->params);
-
-    resized = false;
+    if (terminal_swapchain_size_changed(p->swapchain)) {
+        int prev_height = vo->dheight;
+        int prev_width = vo->dwidth;
+        get_win_size(vo, &p->rows, &p->cols, &vo->dwidth, &vo->dheight);
+        if (prev_width != vo->dwidth || prev_height != vo->dheight)
+            reconfig(vo, vo->params);
+    }
 
     if (frame->current) {
         mpi = mp_image_new_ref(frame->current);
@@ -263,73 +267,91 @@ static void draw_frame(struct vo *vo, struct vo_frame *frame)
         src_rc.y0 = MP_ALIGN_DOWN(src_rc.y0, mpi->fmt.align_y);
         mp_image_crop_rc(mpi, src_rc);
 
-        mp_sws_scale(p->sws, p->frame, mpi);
+        mp_image_clear_rc_inv(p->frame, p->dst);
+        struct mp_image dst = *p->frame;
+        mp_image_crop_rc(&dst, p->dst);
+        mp_sws_scale(p->sws, &dst, mpi);
     } else {
-        mp_image_clear(p->frame, 0, 0, p->width, p->height);
+        mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
     }
 
-    struct mp_osd_res res = { .w = p->width, .h = p->height };
-    osd_draw_on_image(vo->osd, res, mpi ? mpi->pts : 0, 0, p->frame);
-
+    osd_draw_on_image(vo->osd, p->osd, mpi ? mpi->pts : 0, 0, p->frame);
 
     if (p->opts.use_shm && !create_shm(vo))
-        return;
+        goto done;
 
-    memcpy_pic(p->buffer, p->frame->planes[0], p->width * BYTES_PER_PX,
-               p->height, p->width * BYTES_PER_PX, p->frame->stride[0]);
+    memcpy_pic(p->buffer, p->frame->planes[0], p->frame->w * BYTES_PER_PX,
+               p->frame->h, p->frame->w * BYTES_PER_PX, p->frame->stride[0]);
 
     if (!p->opts.use_shm)
         av_base64_encode(p->output, p->output_size, p->buffer, p->buffer_size);
 
+done:
     talloc_free(mpi);
+    return VO_TRUE;
 }
 
 static void flip_page(struct vo *vo)
 {
-    struct priv* p = vo->priv;
-
-    if (p->buffer == NULL)
+    struct priv *p = vo->priv;
+    if (!p->buffer)
         return;
 
-    char *cmd = talloc_asprintf(NULL, TERM_ESC_GOTO_YX, p->top, p->left);
+    bstr *cmd = terminal_swapchain_acquire(p->swapchain);
+
+    // Start with ESC to position the cursor
+    append_asprintf_passthrough(p, cmd, TERM_ESC_GOTO_YX, p->top, p->left);
 
     if (p->opts.use_shm) {
-        cmd = talloc_asprintf_append(cmd, KITTY_ESC_IMG_SHM, p->width, p->height, p->shm_path_b64);
+        append_asprintf_passthrough(p, cmd, KITTY_ESC_IMG_SHM,
+                                    vo->dwidth, vo->dheight, p->shm_path_b64);
+        append_passthrough(p, cmd, KITTY_ESC_END);
     } else {
-        if (p->output == NULL) {
-            talloc_free(cmd);
+        if (!p->output) {
+            terminal_swapchain_present(p->swapchain, cmd);
             return;
         }
 
-        cmd = talloc_asprintf_append(cmd, KITTY_ESC_IMG, p->width, p->height);
-        for (int offset = 0, noffset;; offset += noffset) {
-            if (offset)
-                cmd = talloc_asprintf_append(cmd, KITTY_ESC_CONTINUE, offset < p->output_size);
-            noffset = MPMIN(4096, p->output_size - offset);
-            cmd = talloc_strndup_append(cmd, p->output + offset, noffset);
-            cmd = talloc_strdup_append(cmd, KITTY_ESC_END);
+        append_asprintf_passthrough(p, cmd, KITTY_ESC_IMG,
+                                    vo->dwidth, vo->dheight);
 
-            if (offset >= p->output_size)
-                break;
+        int output_size = p->output_size - 1;
+        int offset = 0;
+
+        for (; offset < output_size; ) {
+            int chunk = MPMIN(4096, output_size - offset);
+
+            if (offset > 0)
+                append_asprintf_passthrough(p, cmd, KITTY_ESC_CONTINUE,
+                                            offset + chunk < output_size);
+
+            // Append at max chunk bytes
+            bstr_xappend(NULL, cmd, (bstr){p->output + offset, chunk});
+            append_passthrough(p, cmd, KITTY_ESC_END);
+            offset += chunk;
+        }
+
+        // When the data is less than or equal to chunk size the final packet
+        // isn't sent, i.e. an escape sequence with `m=0`.
+        // This ensures that an escape sequence with `m=0` is sent and
+        // terminals stay happy
+        if (offset == 0) {
+            append_asprintf_passthrough(p, cmd, KITTY_ESC_CONTINUE, 0);
+            append_passthrough(p, cmd, KITTY_ESC_END);
         }
     }
 
-    write_str(cmd);
-    talloc_free(cmd);
+    terminal_swapchain_present(p->swapchain, cmd);
 
 #if HAVE_POSIX
-    if (p->opts.use_shm)
+    // The terminal reads the image from the shared memory when it gets the
+    // command, so that has to be written before the next frame replaces it.
+    if (p->opts.use_shm) {
+        terminal_swapchain_wait(p->swapchain);
         close_shm(p);
+    }
 #endif
 }
-
-#if HAVE_POSIX
-static void handle_winch(int sig) {
-    resized = true;
-    if (saved_sigaction.sa_handler)
-        saved_sigaction.sa_handler(sig);
-}
-#endif
 
 static int preinit(struct vo *vo)
 {
@@ -339,20 +361,13 @@ static int preinit(struct vo *vo)
     p->sws->log = vo->log;
     mp_sws_enable_cmdline_opts(p->sws, vo->global);
 
-#if HAVE_POSIX
-    struct sigaction sa = {
-        .sa_handler = handle_winch,
-    };
-    sigaction(SIGWINCH, &sa, &saved_sigaction);
-#endif
-
 #if HAVE_POSIX_SHM
     if (p->opts.use_shm) {
         p->shm_path = talloc_asprintf(vo, "/mpv-kitty-%p", vo);
-        int p_size = strlen(p->shm_path) - 1;
+        int p_size = strlen(p->shm_path);
         int b64_size = AV_BASE64_SIZE(p_size);
         p->shm_path_b64 = talloc_array(vo, char, b64_size);
-        av_base64_encode(p->shm_path_b64, b64_size, p->shm_path + 1, p_size);
+        av_base64_encode(p->shm_path_b64, b64_size, p->shm_path, p_size);
     }
 #else
     if (p->opts.use_shm) {
@@ -361,10 +376,24 @@ static int preinit(struct vo *vo)
     }
 #endif
 
-    write_str(TERM_ESC_HIDE_CURSOR);
-    terminal_set_mouse_input(true);
+    if (p->opts.auto_multiplexer_passthrough) {
+        if (getenv("TMUX")) {
+            p->dcs_prefix = DCS_TMUX_PREFIX;
+        } else if (getenv("STY")) {
+            p->dcs_prefix = DCS_SCREEN_PREFIX;
+        }
+
+        if (p->dcs_prefix.len)
+            p->dcs_suffix = DCS_SUFFIX;
+    }
+
+    p->swapchain = terminal_swapchain_create(vo);
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_HIDE_CURSOR));
     if (p->opts.alt_screen)
-        write_str(TERM_ESC_ALT_SCREEN);
+        bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_ALT_SCREEN));
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(true);
 
     return 0;
 }
@@ -376,8 +405,14 @@ static int query_format(struct vo *vo, int format)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
-    if (request == VOCTRL_SET_PANSCAN)
+    struct priv *p = vo->priv;
+    switch (request) {
+    case VOCTRL_SET_PANSCAN:
         return (vo->config_ok && !reconfig(vo, vo->params)) ? VO_TRUE : VO_FALSE;
+    case VOCTRL_CHECK_EVENTS:
+        terminal_swapchain_check_events(p->swapchain);
+        return VO_TRUE;
+    }
     return VO_NOTIMPL;
 }
 
@@ -385,19 +420,18 @@ static void uninit(struct vo *vo)
 {
     struct priv *p = vo->priv;
 
-#if HAVE_POSIX
-    sigaction(SIGWINCH, &saved_sigaction, NULL);
-#endif
-
-    write_str(TERM_ESC_RESTORE_CURSOR);
-    terminal_set_mouse_input(false);
-
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    append_passthrough(p, out, KITTY_ESC_DELETE_ALL);
+    append_passthrough(p, out, KITTY_ESC_END);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_RESTORE_CURSOR));
     if (p->opts.alt_screen) {
-        write_str(TERM_ESC_NORMAL_SCREEN);
+        bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_NORMAL_SCREEN));
     } else {
-        char *cmd = talloc_asprintf(vo, TERM_ESC_GOTO_YX, p->cols, 0);
-        write_str(cmd);
+        bstr_xappend_asprintf(NULL, out, TERM_ESC_GOTO_YX, p->cols, 0);
     }
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(false);
+    terminal_swapchain_destroy(p->swapchain);
 
     free_bufs(vo);
 }
@@ -430,6 +464,7 @@ const struct vo_driver video_out_kitty = {
         {"config-clear", OPT_BOOL(opts.config_clear), },
         {"alt-screen", OPT_BOOL(opts.alt_screen), },
         {"use-shm", OPT_BOOL(opts.use_shm), },
+        {"auto-multiplexer-passthrough", OPT_BOOL(opts.auto_multiplexer_passthrough), },
         {0}
     },
     .options_prefix = "vo-kitty",

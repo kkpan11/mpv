@@ -53,6 +53,9 @@ struct priv {
     bool playing;
     bool underrun_signalled;
 
+    bool have_sink_map;
+    pa_channel_map sink_map;
+
     char *cfg_host;
     int cfg_buffer;
     bool cfg_latency_hacks;
@@ -80,7 +83,7 @@ static void subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
                          uint32_t idx, void *userdata)
 {
     struct ao *ao = userdata;
-    int type = t & PA_SUBSCRIPTION_MASK_SINK;
+    int type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
     int fac = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
     if ((type == PA_SUBSCRIPTION_EVENT_NEW || type == PA_SUBSCRIPTION_EVENT_REMOVE)
         && fac == PA_SUBSCRIPTION_EVENT_SINK)
@@ -209,25 +212,25 @@ static pa_encoding_t map_digital_format(int format)
 }
 
 static const int speaker_map[][2] = {
-  {PA_CHANNEL_POSITION_FRONT_LEFT,              MP_SPEAKER_ID_FL},
-  {PA_CHANNEL_POSITION_FRONT_RIGHT,             MP_SPEAKER_ID_FR},
-  {PA_CHANNEL_POSITION_FRONT_CENTER,            MP_SPEAKER_ID_FC},
-  {PA_CHANNEL_POSITION_REAR_CENTER,             MP_SPEAKER_ID_BC},
-  {PA_CHANNEL_POSITION_REAR_LEFT,               MP_SPEAKER_ID_BL},
-  {PA_CHANNEL_POSITION_REAR_RIGHT,              MP_SPEAKER_ID_BR},
-  {PA_CHANNEL_POSITION_LFE,                     MP_SPEAKER_ID_LFE},
-  {PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER,    MP_SPEAKER_ID_FLC},
-  {PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER,   MP_SPEAKER_ID_FRC},
-  {PA_CHANNEL_POSITION_SIDE_LEFT,               MP_SPEAKER_ID_SL},
-  {PA_CHANNEL_POSITION_SIDE_RIGHT,              MP_SPEAKER_ID_SR},
-  {PA_CHANNEL_POSITION_TOP_CENTER,              MP_SPEAKER_ID_TC},
-  {PA_CHANNEL_POSITION_TOP_FRONT_LEFT,          MP_SPEAKER_ID_TFL},
-  {PA_CHANNEL_POSITION_TOP_FRONT_RIGHT,         MP_SPEAKER_ID_TFR},
-  {PA_CHANNEL_POSITION_TOP_FRONT_CENTER,        MP_SPEAKER_ID_TFC},
-  {PA_CHANNEL_POSITION_TOP_REAR_LEFT,           MP_SPEAKER_ID_TBL},
-  {PA_CHANNEL_POSITION_TOP_REAR_RIGHT,          MP_SPEAKER_ID_TBR},
-  {PA_CHANNEL_POSITION_TOP_REAR_CENTER,         MP_SPEAKER_ID_TBC},
-  {PA_CHANNEL_POSITION_INVALID,                 -1}
+    {PA_CHANNEL_POSITION_FRONT_LEFT,              MP_SPEAKER_ID_FL},
+    {PA_CHANNEL_POSITION_FRONT_RIGHT,             MP_SPEAKER_ID_FR},
+    {PA_CHANNEL_POSITION_FRONT_CENTER,            MP_SPEAKER_ID_FC},
+    {PA_CHANNEL_POSITION_REAR_CENTER,             MP_SPEAKER_ID_BC},
+    {PA_CHANNEL_POSITION_REAR_LEFT,               MP_SPEAKER_ID_BL},
+    {PA_CHANNEL_POSITION_REAR_RIGHT,              MP_SPEAKER_ID_BR},
+    {PA_CHANNEL_POSITION_LFE,                     MP_SPEAKER_ID_LFE},
+    {PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER,    MP_SPEAKER_ID_FLC},
+    {PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER,   MP_SPEAKER_ID_FRC},
+    {PA_CHANNEL_POSITION_SIDE_LEFT,               MP_SPEAKER_ID_SL},
+    {PA_CHANNEL_POSITION_SIDE_RIGHT,              MP_SPEAKER_ID_SR},
+    {PA_CHANNEL_POSITION_TOP_CENTER,              MP_SPEAKER_ID_TC},
+    {PA_CHANNEL_POSITION_TOP_FRONT_LEFT,          MP_SPEAKER_ID_TFL},
+    {PA_CHANNEL_POSITION_TOP_FRONT_RIGHT,         MP_SPEAKER_ID_TFR},
+    {PA_CHANNEL_POSITION_TOP_FRONT_CENTER,        MP_SPEAKER_ID_TFC},
+    {PA_CHANNEL_POSITION_TOP_REAR_LEFT,           MP_SPEAKER_ID_TBL},
+    {PA_CHANNEL_POSITION_TOP_REAR_RIGHT,          MP_SPEAKER_ID_TBR},
+    {PA_CHANNEL_POSITION_TOP_REAR_CENTER,         MP_SPEAKER_ID_TBC},
+    {PA_CHANNEL_POSITION_INVALID,                 -1}
 };
 
 static bool chmap_pa_from_mp(pa_channel_map *dst, struct mp_chmap *src)
@@ -255,8 +258,57 @@ static bool chmap_pa_from_mp(pa_channel_map *dst, struct mp_chmap *src)
     return true;
 }
 
+static void sink_map_cb(pa_context *c, const pa_sink_info *i, int eol, void *ud)
+{
+    struct ao *ao = ud;
+    struct priv *priv = ao->priv;
+
+    if (eol) {
+        pa_threaded_mainloop_signal(priv->mainloop, 0); // wakeup waitop()
+        return;
+    }
+
+    priv->sink_map = i->channel_map;
+    priv->have_sink_map = true;
+}
+
+// Must be called with the mainloop locked.
+static void query_sink_map(struct ao *ao, const char *sink)
+{
+    struct priv *priv = ao->priv;
+
+    priv->have_sink_map = false;
+    if (!waitop_no_unlock(priv, pa_context_get_sink_info_by_name(priv->context, sink,
+                                                                 sink_map_cb, ao)))
+    {
+        MP_VERBOSE(ao, "Could not get the sink's channel map.\n");
+    }
+}
+
 static bool select_chmap(struct ao *ao, pa_channel_map *dst)
 {
+    struct priv *priv = ao->priv;
+
+    if (mp_chmap_is_unknown(&ao->channels) && priv->have_sink_map &&
+        ao->channels.num <= PA_CHANNELS_MAX)
+    {
+        // Channels without positions take the sink's positions in order, so
+        // the server maps them by index. Extra channels get AUX positions the
+        // sink does not use.
+        int aux = 0;
+        dst->channels = ao->channels.num;
+        for (int n = 0; n < dst->channels; n++) {
+            if (n < priv->sink_map.channels) {
+                dst->map[n] = priv->sink_map.map[n];
+                continue;
+            }
+            while (pa_channel_map_has_position(&priv->sink_map, PA_CHANNEL_POSITION_AUX0 + aux))
+                aux++;
+            dst->map[n] = PA_CHANNEL_POSITION_AUX0 + aux++;
+        }
+        return true;
+    }
+
     struct mp_chmap_sel sel = {0};
     for (int n = 0; speaker_map[n][1] != -1; n++)
         mp_chmap_sel_add_speaker(&sel, speaker_map[n][1]);
@@ -314,10 +366,8 @@ static int pa_init_boilerplate(struct ao *ao)
     }
 
     MP_VERBOSE(ao, "Library version: %s\n", pa_get_library_version());
-    MP_VERBOSE(ao, "Proto: %lu\n",
-        (long)pa_context_get_protocol_version(priv->context));
-    MP_VERBOSE(ao, "Server proto: %lu\n",
-        (long)pa_context_get_server_protocol_version(priv->context));
+    MP_VERBOSE(ao, "Proto: %" PRIu32 "\n",
+               pa_context_get_protocol_version(priv->context));
 
     pa_context_set_state_callback(priv->context, context_state_cb, ao);
     pa_context_set_subscribe_callback(priv->context, subscribe_cb, ao);
@@ -334,6 +384,9 @@ static int pa_init_boilerplate(struct ao *ao)
             goto fail;
         pa_threaded_mainloop_wait(priv->mainloop);
     }
+
+    MP_VERBOSE(ao, "Server proto: %" PRIu32 "\n",
+               pa_context_get_server_protocol_version(priv->context));
 
     pa_threaded_mainloop_unlock(priv->mainloop);
     return 0;
@@ -404,8 +457,16 @@ static int init(struct ao *ao)
     }
     (void)pa_proplist_sets(proplist, PA_PROP_MEDIA_ICON_NAME, ao->client_name);
 
+    if (ao->set_media_role)
+        (void)pa_proplist_sets(proplist, PA_PROP_MEDIA_ROLE,
+                               ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC
+                               ? "music" : "video");
+
     if (!(format = pa_format_info_new()))
         goto unlock_and_fail;
+
+    if (mp_chmap_is_unknown(&ao->channels))
+        query_sink_map(ao, sink);
 
     if (!set_format(ao, format)) {
         ao->channels = (struct mp_chmap) MP_CHMAP_INIT_STEREO;

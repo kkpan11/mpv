@@ -25,6 +25,7 @@
 #include "common/msg.h"
 #include "demux/demux.h"
 #include "demux/packet.h"
+#include "demux/packet_pool.h"
 #include "demux/stheader.h"
 
 #include "recorder.h"
@@ -41,6 +42,7 @@
 struct mp_recorder {
     struct mpv_global *global;
     struct mp_log *log;
+    struct demux_packet_pool *packet_pool;
 
     struct mp_recorder_sink **streams;
     int num_streams;
@@ -133,10 +135,14 @@ struct mp_recorder *mp_recorder_create(struct mpv_global *global,
                                        struct demux_attachment **attachments,
                                        int num_attachments)
 {
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    return NULL;
+#endif
     struct mp_recorder *priv = talloc_zero(NULL, struct mp_recorder);
 
     priv->global = global;
     priv->log = mp_log_new(priv, global->log, "recorder");
+    priv->packet_pool = demux_packet_pool_get(global);
 
     if (!num_streams) {
         MP_ERR(priv, "No streams.\n");
@@ -412,7 +418,7 @@ void mp_recorder_feed_packet(struct mp_recorder_sink *rst,
         return;
     }
 
-    pkt = demux_copy_packet(pkt);
+    pkt = demux_copy_packet(rst->owner->packet_pool, pkt);
     if (!pkt)
         return;
     MP_TARRAY_APPEND(rst, rst->packets, rst->num_packets, pkt);

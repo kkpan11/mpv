@@ -8,7 +8,7 @@ You can encode files from one format/codec to another using this facility.
 
 ``--of=<format>``
     Specifies the output format (overrides autodetection by the file name
-    extension of the file specified by ``-o``). See ``--of=help`` for a full
+    extension of the file specified by ``--o``). See ``--of=help`` for a full
     list of supported formats.
 
 ``--ofopts=<options>``
@@ -102,5 +102,5 @@ You can encode files from one format/codec to another using this facility.
     .. admonition:: Example
 
         "``--oremove-metadata=comment,genre``"
-            excludes copying of the the comment and genre tags to the output
+            excludes copying of the comment and genre tags to the output
             file.

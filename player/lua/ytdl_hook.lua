@@ -4,9 +4,10 @@ local options = require 'mp.options'
 
 local o = {
     exclude = "",
+    include = "^%w+%.youtube%.com/|^youtube%.com/|^youtu%.be/|^%w+%.twitch%.tv/|^twitch%.tv/",
     try_ytdl_first = false,
     use_manifests = false,
-    all_formats = false,
+    all_formats = true,
     force_all_formats = true,
     thumbnails = "none",
     ytdl_path = "",
@@ -25,31 +26,44 @@ options.read_options(o, nil, function()
 end)
 
 local chapter_list = {}
+local metadata = {}
 local playlist_cookies = {}
+local playlist_metadata = {}
+local stream_delay = 0
 
-function Set (t)
+local function Set (t)
     local set = {}
     for _, v in pairs(t) do set[v] = true end
     return set
 end
 
--- ?: surrogate (keep in mind that there is no lazy evaluation)
-function iif(cond, if_true, if_false)
-    if cond then
-        return if_true
-    end
-    return if_false
-end
-
 -- youtube-dl JSON name to mpv tag name
 local tag_list = {
+    ["title"]           = "title",
+    ["artist"]          = "artist",
+    ["album"]           = "album",
+    ["album_artist"]    = "album_artist",
+    ["composer"]        = "composer",
+    ["upload_date"]     = "date",
+    ["genre"]           = "genre",
+    ["series"]          = "series",
+    ["track"]           = "title",
+    ["track_number"]    = "track",
     ["uploader"]        = "uploader",
     ["channel_url"]     = "channel_url",
-    -- these titles tend to be a bit too long, so hide them on the terminal
-    -- (default --display-tags does not include this name)
+
+    -- These tags are not displayed by default, but can be shown with
+    -- --display-tags
+    ["playlist"]        = "ytdl_playlist",
+    ["playlist_index"]  = "ytdl_playlist_index",
+    ["playlist_title"]  = "ytdl_playlist_title",
+    ["playlist_id"]     = "ytdl_playlist_id",
+    ["chapter"]         = "ytdl_chapter",
+    ["season"]          = "ytdl_season",
+    ["episode"]         = "ytdl_episode",
+    ["is_live"]         = "ytdl_is_live",
+    ["release_year"]    = "ytdl_release_year",
     ["description"]     = "ytdl_description",
-    -- "title" is handled by force-media-title
-    -- tags don't work with all_formats=yes
 }
 
 local safe_protos = Set {
@@ -60,36 +74,44 @@ local safe_protos = Set {
 
 -- For some sites, youtube-dl returns the audio codec (?) only in the "ext" field.
 local ext_map = {
+    ["aac"]         = "aac",
+    ["alac"]        = "alac",
+    ["ape"]         = "ape",
+    ["flac"]        = "flac",
+    ["m4a"]         = "aac",
     ["mp3"]         = "mp3",
     ["opus"]        = "opus",
+    ["spx"]         = "speex",
+    ["vorbis"]      = "vorbis",
 }
 
-local codec_map = {
-    -- src pattern  = mpv codec
+-- Codec names reported by yt-dlp that mpv does not know. Everything else is
+-- passed through, mpv resolves RFC 6381 codec strings itself.
+local codec_aliases = {
+    ["h265"]        = "hevc",
+    ["m4a"]         = "aac",
+}
+
+-- Subtitle formats by yt-dlp "ext".
+local sub_codec_map = {
+    ["ass"]         = "ass",
+    ["lrc"]         = "text",
+    ["scc"]         = "eia_608",
+    ["srt"]         = "subrip",
+    ["ssa"]         = "ass",
     ["vtt"]         = "webvtt",
-    ["opus"]        = "opus",
-    ["vp9"]         = "vp9",
-    ["avc1%..*"]    = "h264",
-    ["av01%..*"]    = "av1",
-    ["mp4a%..*"]    = "aac",
 }
 
--- Codec name as reported by youtube-dl mapped to mpv internal codec names.
--- Fun fact: mpv will not really use the codec, but will still try to initialize
--- the codec on track selection (just to scrap it), meaning it's only a hint,
--- but one that may make initialization fail. On the other hand, if the codec
--- is valid but completely different from the actual media, nothing bad happens.
+if mp.get_property_native("subrandr-version") ~= nil then
+    sub_codec_map["srv3"] = "subrandr/srv3"
+end
+
+-- The codec is only a hint, decoding uses the codec of the opened stream.
 local function map_codec_to_mpv(codec)
     if codec == nil then
         return nil
     end
-    for k, v in pairs(codec_map) do
-        local s, e = codec:find(k)
-        if s == 1 and e == #codec then
-            return v
-        end
-    end
-    return nil
+    return codec_aliases[codec:lower()] or codec
 end
 
 local function platform_is_windows()
@@ -97,10 +119,8 @@ local function platform_is_windows()
 end
 
 local function exec(args)
-    msg.debug("Running: " .. table.concat(args, " "))
-
     return mp.command_native({
-        name = "subprocess",
+        _name = "subprocess",
         args = args,
         capture_stdout = true,
         capture_stderr = true,
@@ -129,7 +149,7 @@ local function set_http_headers(http_headers)
         mp.set_property("file-local-options/user-agent", useragent)
     end
     local additional_fields = {"Cookie", "Referer", "X-Forwarded-For"}
-    for idx, item in pairs(additional_fields) do
+    for _, item in pairs(additional_fields) do
         local field_value = http_headers[item]
         if field_value then
             headers[#headers + 1] = item .. ": " .. field_value
@@ -145,10 +165,13 @@ local special_cookie_field_names = Set {
 }
 
 -- parse single-line Set-Cookie syntax
-local function parse_cookies(cookies_line)
+local function parse_cookies(cookies_line, url)
     if not cookies_line then
         return {}
     end
+    -- parse origin host from url
+    local host = url and url:match("^https?://([^/?#]+)")
+    host = host and host:gsub("^.*@", ""):gsub(":%d*$", "")
     local cookies = {}
     local cookie = {}
     for stem in cookies_line:gmatch('[^;]+') do
@@ -159,57 +182,51 @@ local function parse_cookies(cookies_line)
             if special_cookie_field_names[cmp_name] then
                 cookie[cmp_name] = value
             else
-                if cookie.name and cookie.value then
+                if cookie.name and cookie.domain then
                     table.insert(cookies, cookie)
                 end
                 cookie = {
                     name = name,
                     value = value,
+                    -- without a Domain attribute it is a host-only cookie
+                    domain = host,
                 }
             end
         end
     end
-    if cookie.name and cookie.value then
-        local cookie_key = cookie.domain .. ":" .. cookie.name
-        cookies[cookie_key] = cookie
+    if cookie.name and cookie.domain then
+        table.insert(cookies, cookie)
     end
     return cookies
 end
 
--- serialize cookies for avformat
-local function serialize_cookies_for_avformat(cookies)
+-- serialize cookies in Netscape cookies.txt format
+local function serialize_cookies(cookies)
     local result = ''
     for _, cookie in pairs(cookies) do
-        local cookie_str = ('%s=%s; '):format(cookie.name, cookie.value)
-        for k, v in pairs(cookie) do
-            if k ~= "name" and k ~= "value" then
-                cookie_str = cookie_str .. ('%s=%s; '):format(k, v)
-            end
-        end
-        result = result .. cookie_str .. '\r\n'
+        local domain = cookie.domain
+        result = result .. ("%s\t%s\t%s\t%s\t%s\t%s\t%s\n"):format(
+            domain,
+            (domain:sub(1, 1) == ".") and "TRUE" or "FALSE",
+            cookie.path or "/",
+            cookie.secure and "TRUE" or "FALSE",
+            cookie.expires or "0",
+            cookie.name,
+            cookie.value:gsub('^"(.+)"$', '%1'))
     end
     return result
 end
 
--- set file-local cookies, preserving existing ones
-local function set_cookies(cookies)
+-- set file-local cookies-file pointing at an in-memory cookies.txt
+local function set_cookies(cookies, url)
     if not cookies or cookies == "" then
         return
     end
-
-    local option_key = "file-local-options/stream-lavf-o"
-    local stream_opts = mp.get_property_native(option_key, {})
-    local existing_cookies = parse_cookies(stream_opts["cookies"])
-
-    local new_cookies = parse_cookies(cookies)
-    for cookie_key, cookie in pairs(new_cookies) do
-        if not existing_cookies[cookie_key] then
-            existing_cookies[cookie_key] = cookie
-        end
+    local data = serialize_cookies(parse_cookies(cookies, url))
+    if data ~= "" then
+        mp.set_property_bool("file-local-options/cookies", true)
+        mp.set_property("file-local-options/cookies-file", "memory://" .. data)
     end
-
-    stream_opts["cookies"] = serialize_cookies_for_avformat(existing_cookies)
-    mp.set_property_native(option_key, stream_opts)
 end
 
 local function append_libav_opt(props, name, value)
@@ -237,33 +254,31 @@ local function url_is_safe(url)
     return safe
 end
 
-local function time_to_secs(time_string)
-    local ret
-
-    local a, b, c = time_string:match("(%d+):(%d%d?):(%d%d)")
-    if a ~= nil then
-        ret = (a*3600 + b*60 + c)
-    else
-        a, b = time_string:match("(%d%d?):(%d%d)")
-        if a ~= nil then
-            ret = (a*60 + b)
-        end
-    end
-
-    return ret
+-- yt-dlp marks subtitles that need one of its own downloaders with a protocol.
+local function sub_protocol_is_supported(sub_info)
+    local proto = sub_info.protocol
+    return proto == nil or proto == "http" or proto == "https" or
+           proto:find("^m3u8") ~= nil
 end
 
-local function extract_chapters(data, video_length)
-    local ret = {}
+local function is_whitelisted(url)
+    url = url:match("https?://(.+)")
 
-    for line in data:gmatch("[^\r\n]+") do
-        local time = time_to_secs(line)
-        if time and (time < video_length) then
-            table.insert(ret, {time = time, title = line})
+    if url == nil then
+        return false
+    end
+
+    url = url:lower()
+
+    for match in o.include:gmatch('%|?([^|]+)') do
+        if url:find(match) then
+            msg.verbose("URL matches included substring " .. match ..
+                        ". Trying ytdl first.")
+            return true
         end
     end
-    table.sort(ret, function(a, b) return a.time < b.time end)
-    return ret
+
+    return false
 end
 
 local function is_blacklisted(url)
@@ -274,7 +289,7 @@ local function is_blacklisted(url)
         end
     end
     if #ytdl.blacklisted > 0 then
-        url = url:match('https?://(.+)')
+        url = url:match('https?://(.+)'):lower()
         for _, exclude in ipairs(ytdl.blacklisted) do
             if url:match(exclude) then
                 msg.verbose('URL matches excluded substring. Skipping.')
@@ -335,7 +350,7 @@ local function make_absolute_url(base_url, url)
     rest:gsub("([^/]+)", function(c) table.insert(segs, c) end)
     url:gsub("([^/]+)", function(c) table.insert(segs, c) end)
     local resolved_url = {}
-    for i, v in ipairs(segs) do
+    for _, v in ipairs(segs) do
         if v == ".." then
             table.remove(resolved_url)
         elseif v ~= "." then
@@ -398,7 +413,7 @@ local function edl_track_joined(fragments, protocol, is_live, base)
         table.insert(parts, edl_escape(join_url(base, fragment)))
         if fragment.duration then
             parts[#parts] =
-                parts[#parts] .. ",length="..fragment.duration
+                parts[#parts] .. ",length="..edl_escape(fragment.duration)
         end
     end
     return edl .. table.concat(parts, ";") .. ";"
@@ -478,13 +493,20 @@ local function formats_to_edl(json, formats, use_all_formats)
     local streams = {}
 
     local tbr_only = true
-    for index, track in ipairs(formats) do
+    local has_video_only = false
+    for _, track in ipairs(formats) do
         tbr_only = tbr_only and track["tbr"] and
                    (not track["abr"]) and (not track["vbr"])
+        local video_only = track.vcodec and track.vcodec ~= "none"
+                      and (not track.acodec or track.acodec == "none")
+        has_video_only = has_video_only or video_only
     end
 
+    local has_video_track = false
+    local has_audio_track = false
     local has_requested_video = false
     local has_requested_audio = false
+    local next_program_id = 0
     -- Web players with quality selection always show the highest quality
     -- option at the top. Since tracks are usually listed with the first
     -- track at the top, that should also be the highest quality track.
@@ -492,8 +514,7 @@ local function formats_to_edl(json, formats, use_all_formats)
     -- Iterate in reverse to get best track first.
     for index = #formats, 1, -1 do
         local track = formats[index]
-        local edl_track = nil
-        edl_track = edl_track_joined(track.fragments,
+        local edl_track = edl_track_joined(track.fragments,
             track.protocol, json.is_live,
             track.fragment_base_url)
         if not edl_track and not url_is_safe(track.url) then
@@ -510,6 +531,7 @@ local function formats_to_edl(json, formats, use_all_formats)
                 media_type = "video",
                 codec = map_codec_to_mpv(track.vcodec),
             }
+            has_video_track = true
             if is_default then
                 has_requested_video = true
             end
@@ -520,6 +542,7 @@ local function formats_to_edl(json, formats, use_all_formats)
                 codec = map_codec_to_mpv(track.acodec) or
                         ext_map[track.ext],
             }
+            has_audio_track = true
             if is_default then
                 has_requested_audio = true
             end
@@ -529,6 +552,13 @@ local function formats_to_edl(json, formats, use_all_formats)
         local hdr = {"!new_stream", "!no_clip", "!no_chapters"}
         local skip = #tracks == 0
         local params = ""
+
+        -- For DASH-style sources (video-only + audio-only streams), only video
+        -- formats get a program_id. Audio-only formats are shared across all
+        -- editions. For muxed sources, every format including audio_only becomes
+        -- a separate edition.
+        local has_video = track.vcodec and track.vcodec ~= "none"
+        local dominated = has_video or not has_video_only
 
         if use_all_formats then
             for _, sub in ipairs(tracks) do
@@ -541,8 +571,9 @@ local function formats_to_edl(json, formats, use_all_formats)
                 elseif sub.media_type == "audio" then
                     props = props .. ",samplerate=" .. as_integer(track.asr)
                 end
+                local codec = sub.codec and ",codec=" .. edl_escape(sub.codec) or ""
                 hdr[#hdr + 1] = "!delay_open,media_type=" .. sub.media_type ..
-                    ",codec=" .. (sub.codec or "null") .. props
+                    codec .. props
 
                 -- Add bitrate information etc. for better user selection.
                 local byterate = 0
@@ -573,7 +604,11 @@ local function formats_to_edl(json, formats, use_all_formats)
                 end
                 hdr[#hdr + 1] = "!track_meta,title=" ..
                     edl_escape(title) .. ",byterate=" .. byterate ..
-                    iif(#flags > 0, ",flags=" .. table.concat(flags, "+"), "")
+                    (dominated and ",program_id=" .. next_program_id or "") ..
+                    (#flags > 0 and ",flags=" .. table.concat(flags, "+") or "")
+            end
+            if dominated then
+                next_program_id = next_program_id + 1
             end
 
             if duration > 0 then
@@ -607,7 +642,10 @@ local function formats_to_edl(json, formats, use_all_formats)
         return nil
     end
 
-    if has_requested_audio ~= has_requested_video then
+    -- Only deselect the type that wasn't requested if there are tracks of
+    -- that type, so that e.g. thumbnails of audio-only sources stay selected.
+    if has_requested_audio ~= has_requested_video and
+       has_audio_track and has_video_track then
         local not_req_prop = has_requested_video and "aid" or "vid"
         if mp.get_property(not_req_prop) == "auto" then
             mp.set_property("file-local-options/" .. not_req_prop, "no")
@@ -617,10 +655,20 @@ local function formats_to_edl(json, formats, use_all_formats)
     return res
 end
 
+-- Seconds to wait before the formats become available
+local function get_stream_delay(formats)
+    local available_at = 0
+    for _, track in ipairs(formats or {}) do
+        if type(track.available_at) == "number" then
+            available_at = math.max(available_at, track.available_at)
+        end
+    end
+    return available_at > 0 and math.max(0, available_at - os.time()) or 0
+end
+
 local function add_single_video(json)
     local streamurl = ""
     local format_info = ""
-    local max_bitrate = 0
     local requested_formats = json["requested_formats"] or json["requested_downloads"]
     local all_formats = json["formats"]
     local has_requested_formats = requested_formats and #requested_formats > 0
@@ -630,6 +678,9 @@ local function add_single_video(json)
     local cookies = has_requested_formats
                     and requested_formats[1].cookies
                     or json.cookies
+
+    stream_delay = math.max(stream_delay,
+        get_stream_delay(has_requested_formats and requested_formats or {json}))
 
     if o.use_manifests and valid_manifest(json) then
         -- prefer manifest_url if present
@@ -646,13 +697,10 @@ local function add_single_video(json)
 
         streamurl = mpd_url
 
-        if requested_formats then
-            for _, track in pairs(requested_formats) do
-                max_bitrate = (track.tbr and track.tbr > max_bitrate) and
-                    track.tbr or max_bitrate
+        for json_name, mp_name in pairs(tag_list) do
+            if json[json_name] then
+                metadata[mp_name] = tostring(json[json_name])
             end
-        elseif json.tbr then
-            max_bitrate = json.tbr > max_bitrate and json.tbr or max_bitrate
         end
     end
 
@@ -686,8 +734,7 @@ local function add_single_video(json)
 
     if streamurl == "" and json.url then
         format_info = "youtube-dl (single)"
-        local edl_track = nil
-        edl_track = edl_track_joined(json.fragments, json.protocol,
+        local edl_track = edl_track_joined(json.fragments, json.protocol,
             json.is_live, json.fragment_base_url)
 
         if not edl_track and not url_is_safe(json.url) then
@@ -709,17 +756,6 @@ local function add_single_video(json)
 
     mp.set_property("stream-open-filename", streamurl:gsub("^data:", "data://", 1))
 
-    if mp.get_property("force-media-title", "") == "" then
-        mp.set_property("file-local-options/force-media-title", json.title)
-    end
-
-    -- set hls-bitrate for dash track selection
-    if max_bitrate > 0 and
-        not option_was_set("hls-bitrate") and
-        not option_was_set_locally("hls-bitrate") then
-        mp.set_property_native('file-local-options/hls-bitrate', max_bitrate*1000)
-    end
-
     -- add subtitles
     if json.requested_subtitles ~= nil then
         local subs = {}
@@ -729,28 +765,31 @@ local function add_single_video(json)
         table.sort(subs, function(a, b) return a.lang < b.lang end)
         for _, e in ipairs(subs) do
             local lang, sub_info = e.lang, e.info
-            msg.verbose("adding subtitle ["..lang.."]")
 
             local sub = nil
 
-            if sub_info.data ~= nil then
-                sub = "memory://"..sub_info.data
+            if not sub_protocol_is_supported(sub_info) then
+                msg.verbose("Skipping subtitle ["..lang.."] with protocol "..
+                            sub_info.protocol)
+            elseif sub_info.data ~= nil then
+                sub = "data://text/plain,"..sub_info.data
             elseif sub_info.url ~= nil and
                 url_is_safe(sub_info.url) then
                 sub = sub_info.url
+            else
+                msg.verbose("No subtitle data/url for ["..lang.."]")
             end
 
             if sub ~= nil then
+                msg.verbose("adding subtitle ["..lang.."]")
                 local edl = "edl://!no_clip;!delay_open,media_type=sub"
-                local codec = map_codec_to_mpv(sub_info.ext)
+                local codec = sub_codec_map[sub_info.ext]
                 if codec then
                     edl = edl .. ",codec=" .. codec
                 end
                 edl = edl .. ";" .. edl_escape(sub)
                 local title = sub_info.name or sub_info.ext
                 mp.commandv("sub-add", edl, "auto", title, lang)
-            else
-                msg.verbose("No subtitle data/url for ["..lang.."]")
             end
         end
     end
@@ -763,13 +802,14 @@ local function add_single_video(json)
 
         for i = #json.thumbnails, 1, -1 do
             local thumb_info = json.thumbnails[i]
-            if thumb_info.url ~= nil then
+            if thumb_info.url ~= nil and url_is_safe(thumb_info.url) then
                 if o.thumbnails == 'all' then
                     msg.verbose("adding thumbnail")
                     mp.commandv("video-add", thumb_info.url, "auto")
                     thumb_height = 0
-                elseif (thumb_preference ~= nil and (thumb_info.preference or -math.huge) > thumb_preference) or
-                    (thumb_preference == nil and ((thumb_info.height or 0) > thumb_height)) then
+                elseif (thumb_preference ~= nil and
+                        (thumb_info.preference or -math.huge) > thumb_preference) or
+                       (thumb_preference == nil and (thumb_info.height or 0) > thumb_height) then
                     thumb = thumb_info.url
                     thumb_height = thumb_info.height or 0
                     thumb_preference = thumb_info.preference
@@ -788,6 +828,7 @@ local function add_single_video(json)
     -- add chapters
     if json.chapters then
         msg.debug("Adding pre-parsed chapters")
+        chapter_list = {}
         for i = 1, #json.chapters do
             local chapter = json.chapters[i]
             local title = chapter.title or ""
@@ -796,12 +837,10 @@ local function add_single_video(json)
             end
             table.insert(chapter_list, {time=chapter.start_time, title=title})
         end
-    elseif json.description ~= nil and json.duration ~= nil then
-        chapter_list = extract_chapters(json.description, json.duration)
     end
 
     -- set start time
-    if json.start_time or json.section_start and
+    if (json.start_time or json.section_start) and
         not option_was_set("start") and
         not option_was_set_locally("start") then
         local start_time = json.start_time or json.section_start
@@ -810,7 +849,7 @@ local function add_single_video(json)
     end
 
     -- set end time
-    if json.end_time or json.section_end and
+    if (json.end_time or json.section_end) and
         not option_was_set("end") and
         not option_was_set_locally("end") then
         local end_time = json.end_time or json.section_end
@@ -842,45 +881,32 @@ local function add_single_video(json)
             "rtmp_app", json.app)
     end
 
-    if json.proxy and json.proxy ~= "" then
-        stream_opts = append_libav_opt(stream_opts,
-            "http_proxy", json.proxy)
+    if json.proxy and json.proxy ~= "" and not option_was_set("http-proxy") then
+        mp.set_property("file-local-options/http-proxy", json.proxy)
     end
 
-    if cookies and cookies ~= "" then
-        local existing_cookies = parse_cookies(stream_opts["cookies"])
-        local new_cookies = parse_cookies(cookies)
-        for cookie_key, cookie in pairs(new_cookies) do
-            existing_cookies[cookie_key] = cookie
+    set_cookies(cookies, has_requested_formats and requested_formats[1].url
+                         or json.url)
+
+    local chunk_size = math.huge
+    if has_requested_formats then
+        for _, f in pairs(requested_formats) do
+            if f.downloader_options and f.downloader_options.http_chunk_size then
+                chunk_size = math.min(chunk_size, tonumber(f.downloader_options.http_chunk_size))
+            end
         end
-        stream_opts["cookies"] = serialize_cookies_for_avformat(existing_cookies)
+    end
+    if chunk_size < math.huge then
+        stream_opts = append_libav_opt(stream_opts, "request_size", tostring(chunk_size))
+        mp.set_property_native("file-local-options/curl-max-request-size", chunk_size)
     end
 
     mp.set_property_native("file-local-options/stream-lavf-o", stream_opts)
 end
 
-local function check_version(ytdl_path)
-    local command = {
-        name = "subprocess",
-        capture_stdout = true,
-        args = {ytdl_path, "--version"}
-    }
-    local version_string = mp.command_native(command).stdout
-    local year, month, day = string.match(version_string, "(%d+).(%d+).(%d+)")
-
-    -- sanity check
-    if tonumber(year) < 2000 or tonumber(month) > 12 or
-        tonumber(day) > 31 then
-        return
-    end
-    local version_ts = os.time{year=year, month=month, day=day}
-    if os.difftime(os.time(), version_ts) > 60*60*24*90 then
-        msg.warn("It appears that your youtube-dl version is severely out of date.")
-    end
-end
-
-function run_ytdl_hook(url)
+local function run_ytdl_hook(url)
     local start_time = os.clock()
+    stream_delay = 0
 
     -- strip ytdl://
     if url:find("ytdl://") == 1 then
@@ -906,7 +932,11 @@ function run_ytdl_hook(url)
     end
 
     if format == "" then
-        format = "bestvideo+bestaudio/best"
+        -- youtube-dl defaults to separate video and audio tracks only when it
+        -- finds ffmpeg to merge them, which mpv doesn't need. The "bestvideo*"
+        -- alternative is for yt-dlp, youtube-dl treats it as an unknown format
+        -- and moves on to the next one.
+        format = "bestvideo*+bestaudio/bestvideo+bestaudio/best"
     end
 
     if format ~= "ytdl" then
@@ -916,7 +946,7 @@ function run_ytdl_hook(url)
 
     for param, arg in pairs(raw_options) do
         table.insert(command, "--" .. param)
-        if arg ~= "" then
+        if arg ~= "" or param == "proxy" then
             table.insert(command, arg)
         end
         if (param == "sub-lang" or param == "sub-langs" or param == "srt-lang") and (arg ~= "") then
@@ -929,8 +959,11 @@ function run_ytdl_hook(url)
     end
 
     if allsubs == true then
-        table.insert(command, "--all-subs")
+        table.insert(command, "--sub-langs")
+        table.insert(command, "all")
     end
+    table.insert(command, "--write-srt")
+
     if not use_playlist then
         table.insert(command, "--no-playlist")
     end
@@ -951,7 +984,8 @@ function run_ytdl_hook(url)
 
         for _, path in pairs(ytdl.paths_to_search) do
             -- search for youtube-dl in mpv's config dir
-            local exesuf = platform_is_windows() and not path:lower():match("%.exe$") and ".exe" or ""
+            local exesuf = platform_is_windows() and not path:lower():match("%.exe$")
+                           and ".exe" or ""
             local ytdl_cmd = mp.find_config_file(path .. exesuf)
             if ytdl_cmd then
                 msg.verbose("Found youtube-dl at: " .. ytdl_cmd)
@@ -960,11 +994,13 @@ function run_ytdl_hook(url)
                 result = exec(command)
                 break
             else
-                msg.verbose("No youtube-dl found with path " .. path .. exesuf .. " in config directories")
+                msg.verbose("No youtube-dl found with path " .. path .. exesuf ..
+                            " in config directories")
                 command[1] = path
                 result = exec(command)
                 if result.error_string == "init" then
-                    msg.verbose("youtube-dl with path " .. path .. " not found in PATH or not enough permissions")
+                    msg.verbose("youtube-dl with path " .. path ..
+                                " not found in PATH or not enough permissions")
                 else
                     msg.verbose("Found youtube-dl with path " .. path .. " in PATH")
                     ytdl.path = path
@@ -974,11 +1010,15 @@ function run_ytdl_hook(url)
         end
 
         ytdl.searched = true
+
+        mp.set_property("user-data/mpv/ytdl/path", ytdl.path or "")
     end
 
     if result.killed_by_us then
         return
     end
+
+    mp.set_property_native("user-data/mpv/ytdl/json-subprocess-result", result)
 
     local json = result.stdout
     local parse_err = nil
@@ -996,7 +1036,7 @@ function run_ytdl_hook(url)
         msg.verbose("stderr:", result.stderr)
 
         -- trim our stderr to avoid spurious newlines
-        ytdl_err = result.stderr:gsub("^%s*(.-)%s*$", "%1")
+        local ytdl_err = result.stderr:gsub("^%s*(.-)%s*$", "%1")
         msg.error(ytdl_err)
         local err = "youtube-dl failed: "
         if result.error_string and result.error_string == "init" then
@@ -1007,9 +1047,6 @@ function run_ytdl_hook(url)
             err = err .. "unexpected error occurred"
         end
         msg.error(err)
-        if parse_err or string.find(ytdl_err, "yt%-dl%.org/bug") then
-            check_version(ytdl.path)
-        end
         return
     end
 
@@ -1031,6 +1068,11 @@ function run_ytdl_hook(url)
             msg.warn("Got empty playlist, nothing to play.")
             return
         end
+
+        playlist_metadata[url] = {
+            playlist_title = json["title"],
+            playlist_id = json["id"]
+        }
 
         local self_redirecting_url =
             json.entries[1]["_type"] ~= "url_transparent" and
@@ -1054,7 +1096,8 @@ function run_ytdl_hook(url)
 
             -- can't change the http headers for each entry, so use the 1st
             set_http_headers(json.entries[1].http_headers)
-            set_cookies(json.entries[1].cookies or json.cookies)
+            set_cookies(json.entries[1].cookies or json.cookies,
+                        json.entries[1].url)
 
             mp.set_property("stream-open-filename", playlist)
             if json.title and mp.get_property("force-media-title", "") == "" then
@@ -1074,19 +1117,26 @@ function run_ytdl_hook(url)
             if entry_wsubs ~= nil and
                 json.entries[entry_wsubs].duration ~= nil then
                 for j, req in pairs(json.entries[entry_wsubs].requested_subtitles) do
-                    local subfile = "edl://"
-                    for i, entry in pairs(json.entries) do
-                        if entry.requested_subtitles ~= nil and
-                            entry.requested_subtitles[j] ~= nil and
-                            url_is_safe(entry.requested_subtitles[j].url) then
-                            subfile = subfile..edl_escape(entry.requested_subtitles[j].url)
-                        else
-                            subfile = subfile..edl_escape("memory://WEBVTT")
+                    if not sub_protocol_is_supported(req) then
+                        msg.verbose("Skipping subtitle ["..j.."] with protocol "..
+                                    req.protocol)
+                    else
+                        local subfile = "edl://"
+                        for _, entry in pairs(json.entries) do
+                            local sub_info = entry.requested_subtitles and
+                                             entry.requested_subtitles[j]
+                            if sub_info ~= nil and
+                                sub_protocol_is_supported(sub_info) and
+                                url_is_safe(sub_info.url) then
+                                subfile = subfile..edl_escape(sub_info.url)
+                            else
+                                subfile = subfile..edl_escape("memory://WEBVTT")
+                            end
+                            subfile = subfile..",length="..edl_escape(entry.duration)..";"
                         end
-                        subfile = subfile..",length="..entry.duration..";"
+                        msg.debug(j.." sub EDL: "..subfile)
+                        mp.commandv("sub-add", subfile, "auto", req.ext, j)
                     end
-                    msg.debug(j.." sub EDL: "..subfile)
-                    mp.commandv("sub-add", subfile, "auto", req.ext, j)
                 end
             end
 
@@ -1096,14 +1146,9 @@ function run_ytdl_hook(url)
         else
             local playlist_index = parse_yt_playlist(url, json)
             local playlist = {"#EXTM3U"}
-            for i, entry in pairs(json.entries) do
+            for _, entry in pairs(json.entries) do
                 local site = entry.url
                 local title = entry.title
-
-                if title ~= nil then
-                    title = string.gsub(title, '%s+', ' ')
-                    table.insert(playlist, "#EXTINF:0," .. title)
-                end
 
                 --[[ some extractors will still return the full info for
                      all clips in the playlist and the URL will point
@@ -1119,7 +1164,12 @@ function run_ytdl_hook(url)
                 local playlist_url = nil
 
                 -- links without protocol as returned by --flat-playlist
-                if not site:find("://") then
+                if not site then
+                    msg.error("Playlist entry does not have unique URL, can't add it.")
+                elseif site:find("%c") then
+                    -- a line break would add entries to the playlist
+                    msg.error("Playlist entry URL contains control characters, can't add it.")
+                elseif not site:find("://") then
                     -- youtube extractor provides only IDs,
                     -- others come prefixed with the extractor name and ":"
                     local prefix = site:find(":") and "ytdl://" or
@@ -1130,6 +1180,10 @@ function run_ytdl_hook(url)
                 end
 
                 if playlist_url then
+                    if title ~= nil then
+                        title = string.gsub(title, '%s+', ' ')
+                        table.insert(playlist, "#EXTINF:0," .. title)
+                    end
                     table.insert(playlist, playlist_url)
                     -- save the cookies in a table for the playlist hook
                     playlist_cookies[playlist_url] = entry.cookies or json.cookies
@@ -1146,39 +1200,46 @@ function run_ytdl_hook(url)
         end
 
     else -- probably a video
+        -- add playlist metadata if any belongs to the current video
+        for key, value in pairs(playlist_metadata[mp.get_property("playlist-path")] or {}) do
+            json[key] = value
+        end
+
         add_single_video(json)
     end
     msg.debug('script running time: '..os.clock()-start_time..' seconds')
 end
 
-if not o.try_ytdl_first then
-    mp.add_hook("on_load", 10, function ()
-        msg.verbose('ytdl:// hook')
-        local url = mp.get_property("stream-open-filename", "")
-        if url:find("ytdl://") ~= 1 then
-            msg.verbose('not a ytdl:// url')
-            return
-        end
-        run_ytdl_hook(url)
-    end)
+local function on_load_hook(load_fail, hook)
+    local url = mp.get_property("stream-open-filename", "")
+    local force = url:find("^ytdl://") ~= nil
+    local early = force or o.try_ytdl_first or is_whitelisted(url)
+    if early == load_fail then
+        return
+    end
+    if not force and (not url:find("^https?://") or is_blacklisted(url)) then
+        return
+    end
+    run_ytdl_hook(url)
+
+    -- defer loading until the formats become available
+    if stream_delay > 0 then
+        msg.info(("Waiting %.2f seconds for the stream to become available...")
+                 :format(stream_delay))
+        hook:defer()
+        mp.add_timeout(stream_delay, function() hook:cont() end)
+    end
 end
+
+mp.add_hook("on_load", 10, function(hook) on_load_hook(false, hook) end)
+mp.add_hook("on_load_fail", 10, function(hook) on_load_hook(true, hook) end)
 
 mp.add_hook("on_load", 20, function ()
     msg.verbose('playlist hook')
     local url = mp.get_property("stream-open-filename", "")
     if playlist_cookies[url] then
-        set_cookies(playlist_cookies[url])
+        set_cookies(playlist_cookies[url], url)
     end
-end)
-
-mp.add_hook(o.try_ytdl_first and "on_load" or "on_load_fail", 10, function()
-    msg.verbose('full hook')
-    local url = mp.get_property("stream-open-filename", "")
-    if url:find("ytdl://") ~= 1 and
-        not ((url:find("https?://") == 1) and not is_blacklisted(url)) then
-        return
-    end
-    run_ytdl_hook(url)
 end)
 
 mp.add_hook("on_preloaded", 10, function ()
@@ -1188,4 +1249,13 @@ mp.add_hook("on_preloaded", 10, function ()
         mp.set_property_native("chapter-list", chapter_list)
         chapter_list = {}
     end
+
+    for key, value in pairs(metadata) do
+        mp.set_property("metadata/by-key/" .. key, value)
+    end
+    metadata = {}
+end)
+
+mp.add_hook("on_after_end_file", 50, function ()
+    mp.del_property("user-data/mpv/ytdl/json-subprocess-result")
 end)

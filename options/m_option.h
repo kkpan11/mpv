@@ -18,6 +18,7 @@
 #ifndef MPLAYER_M_OPTION_H
 #define MPLAYER_M_OPTION_H
 
+#include <assert.h>
 #include <float.h>
 #include <string.h>
 #include <stddef.h>
@@ -49,6 +50,7 @@ extern const m_option_type_t m_option_type_float;
 extern const m_option_type_t m_option_type_double;
 extern const m_option_type_t m_option_type_string;
 extern const m_option_type_t m_option_type_string_list;
+extern const m_option_type_t m_option_type_prop_array;
 extern const m_option_type_t m_option_type_string_append_list;
 extern const m_option_type_t m_option_type_keyvalue_list;
 extern const m_option_type_t m_option_type_time;
@@ -68,6 +70,7 @@ extern const m_option_type_t m_option_type_aspect;
 extern const m_option_type_t m_option_type_obj_settings_list;
 extern const m_option_type_t m_option_type_node;
 extern const m_option_type_t m_option_type_rect;
+extern const m_option_type_t m_option_type_cycle_dir;
 
 // Used internally by m_config.c
 extern const m_option_type_t m_option_type_alias;
@@ -104,7 +107,7 @@ struct m_geometry {
 };
 
 void m_geometry_apply(int *xpos, int *ypos, int *widw, int *widh,
-                      int scrw, int scrh, struct m_geometry *gm);
+                      int scrw, int scrh, bool center, struct m_geometry *gm);
 void m_rect_apply(struct mp_rect *rc, int w, int h, struct m_geometry *gm);
 
 struct m_channels {
@@ -161,6 +164,8 @@ struct m_obj_list {
     void (*print_help_list)(struct mp_log *log);
     // Callback to print help for _unknown_ entries with "vf=entry=help"
     void (*print_unknown_entry_help)(struct mp_log *log, const char *name);
+    // Get lavfi filters for option-info/[av]f/choices.
+    const char **(*get_lavfi_filters)(void *talloc_ctx);
 };
 
 // Find entry by name
@@ -189,6 +194,9 @@ struct m_opt_choice_alternatives {
 const char *m_opt_choice_str(const struct m_opt_choice_alternatives *choices,
                              int value);
 
+const char *m_opt_choice_str_def(const struct m_opt_choice_alternatives *choices,
+                                 int value, const char *def);
+
 typedef int (*m_opt_generic_validate_fn)(struct mp_log *log, const m_option_t *opt,
                                          struct bstr name, void *value);
 
@@ -212,12 +220,19 @@ struct m_sub_options {
     const void *defaults;
     // Change flags passed to mp_option_change_callback() if any option that is
     // directly or indirectly part of this group is changed.
-    int change_flags;
+    uint64_t change_flags;
     // Return further sub-options, for example for optional components. If set,
     // this is called with increasing index (starting from 0), as long as true
     // is returned. If true is returned and *sub is set in any of these calls,
     // they are added as options.
     bool (*get_sub_options)(int index, const struct m_sub_options **sub);
+};
+
+// A typed C array value for use with m_option_type_prop_array.
+struct m_prop_arr {
+    void *data;                       // first element; owned iff produced by copy
+    int count;                        // number of elements
+    const m_option_type_t *elem_type; // element type (must have a .get callback)
 };
 
 #define CONF_TYPE_BOOL          (&m_option_type_bool)
@@ -228,6 +243,7 @@ struct m_sub_options {
 #define CONF_TYPE_DOUBLE        (&m_option_type_double)
 #define CONF_TYPE_STRING        (&m_option_type_string)
 #define CONF_TYPE_STRING_LIST   (&m_option_type_string_list)
+#define CONF_TYPE_KV_LIST       (&m_option_type_keyvalue_list)
 #define CONF_TYPE_IMGFMT        (&m_option_type_imgfmt)
 #define CONF_TYPE_FOURCC        (&m_option_type_fourcc)
 #define CONF_TYPE_AFMT          (&m_option_type_afmt)
@@ -249,6 +265,7 @@ union m_option_value {
     char *string;
     char **string_list;
     char **keyvalue_list;
+    struct m_prop_arr prop_arr;
     int imgfmt;
     unsigned int fourcc;
     int afmt;
@@ -382,19 +399,22 @@ struct m_option {
     const m_option_type_t *type;
 
     // See \ref OptionFlags.
-    unsigned int flags;
+    uint64_t flags;
 
     // Always force an option update even if the written value does not change.
     bool force_update;
+
+    // If the option is an alias, use the prefix of sub option.
+    bool alias_use_prefix;
 
     int offset;
 
     // Most numeric types restrict the range to [min, max] if min<max (this
     // implies that if min/max are not set, the full range is used). In all
     // cases, the actual range is clamped to the type's native range.
-    // Float types use [DBL_MIN, DBL_MAX], though by setting min or max to
-    // -/+INFINITY, the range can be extended to INFINITY. (This part is buggy
-    // for "float".)
+    // Float type uses [FLT_MIN, FLT_MAX], and double type uses
+    // [DBL_MIN, DBL_MAX], though by setting min or max to -/+INFINITY,
+    // the range can be extended to INFINITY.
     // Preferably use M_RANGE() to set these fields.
     double min, max;
 
@@ -417,64 +437,66 @@ struct m_option {
 
 char *format_file_size(int64_t size);
 
-// The option is forbidden in config files.
-#define M_OPT_NOCFG             (1 << 2)
-
-// The option should be set during command line pre-parsing
-#define M_OPT_PRE_PARSE         (1 << 4)
-
-// The option expects a file name (or a list of file names)
-#define M_OPT_FILE              (1 << 5)
-
-// Do not add as property.
-#define M_OPT_NOPROP            (1 << 6)
-
-// Enable special semantics for some options when parsing the string "help".
-#define M_OPT_HAVE_HELP         (1 << 7)
-
 // The following are also part of the M_OPT_* flags, and are used to update
 // certain groups of options.
-#define UPDATE_OPT_FIRST        (1 << 8)
-#define UPDATE_TERM             (1 << 8)  // terminal options
-#define UPDATE_SUB_FILT         (1 << 9)  // subtitle filter options
-#define UPDATE_OSD              (1 << 10) // related to OSD rendering
-#define UPDATE_BUILTIN_SCRIPTS  (1 << 11) // osc/ytdl/stats
-#define UPDATE_IMGPAR           (1 << 12) // video image params overrides
-#define UPDATE_INPUT            (1 << 13) // mostly --input-* options
-#define UPDATE_AUDIO            (1 << 14) // --audio-channels etc.
-#define UPDATE_PRIORITY         (1 << 15) // --priority (Windows-only)
-#define UPDATE_SCREENSAVER      (1 << 16) // --stop-screensaver
-#define UPDATE_VOL              (1 << 17) // softvol related options
-#define UPDATE_LAVFI_COMPLEX    (1 << 18) // --lavfi-complex
-#define UPDATE_HWDEC            (1 << 20) // --hwdec
-#define UPDATE_DVB_PROG         (1 << 21) // some --dvbin-...
-#define UPDATE_SUB_HARD         (1 << 22) // subtitle opts. that need full reinit
-#define UPDATE_SUB_EXTS         (1 << 23) // update internal list of sub exts
-#define UPDATE_VIDEO            (1 << 24) // force redraw if needed
-#define UPDATE_OPT_LAST         (1 << 24)
+#define UPDATE_TERM             (UINT64_C(1) << 0)   // terminal options
+#define UPDATE_SUB_FILT         (UINT64_C(1) << 1)   // subtitle filter options
+#define UPDATE_OSD              (UINT64_C(1) << 2)   // related to OSD rendering
+#define UPDATE_BUILTIN_SCRIPTS  (UINT64_C(1) << 3)   // osc/ytdl/stats
+#define UPDATE_IMGPAR           (UINT64_C(1) << 4)   // video image params overrides
+#define UPDATE_INPUT            (UINT64_C(1) << 5)   // mostly --input-* options
+#define UPDATE_AUDIO            (UINT64_C(1) << 6)   // --audio-channels etc.
+#define UPDATE_PRIORITY         (UINT64_C(1) << 7)   // --priority (Windows-only)
+#define UPDATE_SCREENSAVER      (UINT64_C(1) << 8)   // --stop-screensaver
+#define UPDATE_VOL              (UINT64_C(1) << 9)   // softvol related options
+#define UPDATE_LAVFI_COMPLEX    (UINT64_C(1) << 10)  // --lavfi-complex
+#define UPDATE_HWDEC            (UINT64_C(1) << 11)  // --hwdec
+#define UPDATE_DVB_PROG         (UINT64_C(1) << 12)  // some --dvbin-...
+#define UPDATE_SUB_HARD         (UINT64_C(1) << 13)  // subtitle opts. that need full reinit
+#define UPDATE_VIDEO            (UINT64_C(1) << 15)  // force redraw if needed
+#define UPDATE_VO               (UINT64_C(1) << 16)  // reinit the VO
+#define UPDATE_CLIPBOARD        (UINT64_C(1) << 17)  // reinit the clipboard
+#define UPDATE_DEMUXER          (UINT64_C(1) << 18)  // invalidate --prefetch-playlist's data
+#define UPDATE_AD               (UINT64_C(1) << 19)  // reinit audio chain and decoder
+#define UPDATE_VD               (UINT64_C(1) << 20)  // reinit video chain and decoder
+#define UPDATE_OPT_LAST         (UINT64_C(1) << 20)
 
-// All bits between _FIRST and _LAST (inclusive)
-#define UPDATE_OPTS_MASK \
-    (((UPDATE_OPT_LAST << 1) - 1) & ~(unsigned)(UPDATE_OPT_FIRST - 1))
+// All bits between of UPDATE_ flags
+#define UPDATE_OPTS_MASK        ((UPDATE_OPT_LAST << 1) - 1)
+
+// The option is forbidden in config files.
+#define M_OPT_NOCFG             (UINT64_C(1) << 63)
+
+// The option should be set during command line pre-parsing
+#define M_OPT_PRE_PARSE         (UINT64_C(1) << 62)
+
+// The option expects a file name (or a list of file names)
+#define M_OPT_FILE              (UINT64_C(1) << 61)
+
+// Do not add as property.
+#define M_OPT_NOPROP            (UINT64_C(1) << 60)
+
+// Enable special semantics for some options when parsing the string "help".
+#define M_OPT_HAVE_HELP         (UINT64_C(1) << 59)
 
 // type_float/type_double: string "default" is parsed as NaN (and reverse)
-#define M_OPT_DEFAULT_NAN       (1 << 25)
+#define M_OPT_DEFAULT_NAN       (UINT64_C(1) << 58)
 
 // type time: string "no" maps to MP_NOPTS_VALUE (if unset, NOPTS is rejected)
-#define M_OPT_ALLOW_NO          (1 << 26)
+// and
+// parsing: "--no-opt" is parsed as "--opt=no"
+#define M_OPT_ALLOW_NO          (UINT64_C(1) << 57)
 
 // type channels: disallow "auto" (still accept ""), limit list to at most 1 item.
-#define M_OPT_CHANNELS_LIMITED  (1 << 27)
+#define M_OPT_CHANNELS_LIMITED  (UINT64_C(1) << 56)
 
 // type_float/type_double: controls if pretty print should trim trailing zeros
-#define M_OPT_FIXED_LEN_PRINT   (1 << 28)
+#define M_OPT_FIXED_LEN_PRINT   (UINT64_C(1) << 55)
 
 // Like M_OPT_TYPE_OPTIONAL_PARAM.
-#define M_OPT_OPTIONAL_PARAM    (1 << 30)
+#define M_OPT_OPTIONAL_PARAM    (UINT64_C(1) << 54)
 
-// These are kept for compatibility with older code.
-#define CONF_NOCFG              M_OPT_NOCFG
-#define CONF_PRE_PARSE          M_OPT_PRE_PARSE
+static_assert(!(UPDATE_OPTS_MASK & M_OPT_OPTIONAL_PARAM), "");
 
 // These flags are used to describe special parser capabilities or behavior.
 
@@ -580,7 +602,7 @@ static inline int m_option_set_node(const m_option_t *opt, void *dst,
 
 // Call m_option_parse for strings, m_option_set_node otherwise.
 int m_option_set_node_or_string(struct mp_log *log, const m_option_t *opt,
-                                const char *name, void *dst, struct mpv_node *src);
+                                struct bstr name, void *dst, struct mpv_node *src);
 
 // see m_option_type.get
 static inline int m_option_get_node(const m_option_t *opt, void *ta_parent,

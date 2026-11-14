@@ -68,7 +68,6 @@ ta.h & ta.c:
     as in it doesn't require valgrind.) You can enable it by setting the
     MPV_LEAK_REPORT environment variable to "1":
         export MPV_LEAK_REPORT=1
-    Or permanently by building with --enable-ta-leak-report.
     This will list all unfree'd allocations on exit.
 
     Documentation can be found here:
@@ -94,7 +93,7 @@ player/core.h:
     usually not accessed by other parts of mpv for the sake of modularization.
 
 player/client.c:
-    This implements the client API (libmpv/client.h). For the most part, this
+    This implements the client API (mpv/client.h). For the most part, this
     just calls into other parts of the player. This also manages a ringbuffer
     of events from player to clients.
 
@@ -273,8 +272,9 @@ sub/:
     sd_ass.c's internal state.
 
 etc/:
-    The files input.conf and builtin.conf are actually integrated into the mpv
-    binary by the build system. They contain the default configs and keybindings.
+    The files input.conf, builtin.conf and menu.conf are actually integrated
+    into the mpv binary by the build system. They contain the default configs
+    and keybindings.
 
 Best practices and Concepts within mpv
 ======================================

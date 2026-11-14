@@ -21,17 +21,15 @@
 #include <libavutil/mem.h>
 #include <libavutil/common.h>
 #include <libavutil/display.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/bswap.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/rational.h>
+#include <libavutil/stereo3d.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libplacebo/utils/libav.h>
-
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 16, 100)
-# include <libavutil/dovi_meta.h>
-#endif
 
 #include "mpv_talloc.h"
 
@@ -55,13 +53,13 @@ static int mp_image_layout(int imgfmt, int w, int h, int stride_align,
 {
     struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(imgfmt);
 
-    w = MP_ALIGN_UP(w, desc.align_x);
-    h = MP_ALIGN_UP(h, desc.align_y);
-
     struct mp_image_params params = {.imgfmt = imgfmt, .w = w, .h = h};
 
     if (!mp_image_params_valid(&params) || desc.flags & MP_IMGFLAG_HWACCEL)
         return -1;
+
+    w = MP_ALIGN_UP(w, desc.align_x);
+    h = MP_ALIGN_UP(h, desc.align_y);
 
     // Note: for non-mod-2 4:2:0 YUV frames, we have to allocate an additional
     //       top/right border. This is needed for correct handling of such
@@ -71,14 +69,21 @@ static int mp_image_layout(int imgfmt, int w, int h, int stride_align,
         int alloc_w = mp_chroma_div_up(w, desc.xs[n]);
         int alloc_h = MP_ALIGN_UP(h, 32) >> desc.ys[n];
         int line_bytes = (alloc_w * desc.bpp[n] + 7) / 8;
-        out_stride[n] = MP_ALIGN_NPOT(line_bytes, stride_align);
-        out_plane_size[n] = out_stride[n] * alloc_h;
+        int align = mp_lcm(stride_align, (desc.bpp[n] && desc.bpp[n] % 8 == 0) ? desc.bpp[n] / 8 : 1);
+        out_stride[n] = MP_ALIGN_NPOT(line_bytes, align);
+        int64_t plane_size = (int64_t)out_stride[n] * alloc_h;
+        if (plane_size < 0 || plane_size > INT_MAX)
+            return -1;
+        out_plane_size[n] = plane_size;
     }
     if (desc.flags & MP_IMGFLAG_PAL)
         out_plane_size[1] = AVPALETTE_SIZE;
 
+    // Leave room for the stride_align bytes the callers add to the size.
     int sum = 0;
     for (int n = 0; n < MP_MAX_PLANES; n++) {
+        if (out_plane_size[n] > INT_MAX - stride_align - sum)
+            return -1;
         out_plane_offset[n] = out_plane_size[n] ? sum : -1;
         sum += out_plane_size[n];
     }
@@ -168,8 +173,8 @@ fail:
 
 static bool mp_image_alloc_planes(struct mp_image *mpi)
 {
-    assert(!mpi->planes[0]);
-    assert(!mpi->bufs[0]);
+    mp_assert(!mpi->planes[0]);
+    mp_assert(!mpi->bufs[0]);
 
     int align = MP_IMAGE_BYTE_ALIGN;
 
@@ -190,13 +195,40 @@ static bool mp_image_alloc_planes(struct mp_image *mpi)
     return true;
 }
 
-void mp_image_setfmt(struct mp_image *mpi, int out_fmt)
+void mp_image_sethwfmt(struct mp_image *mpi, enum mp_imgfmt hw_fmt, enum mp_imgfmt sw_fmt)
 {
-    struct mp_imgfmt_desc fmt = mp_imgfmt_get_desc(out_fmt);
-    mpi->params.imgfmt = fmt.id;
+    struct mp_imgfmt_desc fmt = mp_imgfmt_get_desc(sw_fmt ? sw_fmt : hw_fmt);
+    mpi->params.imgfmt = hw_fmt;
+    mpi->params.hw_subfmt = sw_fmt;
     mpi->fmt = fmt;
-    mpi->imgfmt = fmt.id;
+    mpi->imgfmt = hw_fmt;
     mpi->num_planes = fmt.num_planes;
+    mpi->params.repr.alpha = (fmt.flags & MP_IMGFLAG_ALPHA) ? PL_ALPHA_INDEPENDENT
+                                                            : PL_ALPHA_NONE;
+    // Calculate bit encoding from all components (excluding alpha)
+    struct pl_bit_encoding bits = {0};
+    const int num_comps = mp_imgfmt_desc_get_num_comps(&fmt);
+    for (int c = 0; c < MPMIN(num_comps, 3); c++) {
+        struct pl_bit_encoding cbits = {
+            .sample_depth = fmt.comps[c].size,
+            .color_depth  = fmt.comps[c].size - abs(fmt.comps[c].pad),
+            .bit_shift    = MPMAX(fmt.comps[c].pad, 0),
+        };
+
+        if (bits.sample_depth && !pl_bit_encoding_equal(&bits, &cbits)) {
+            // Bit encoding differs between components, cannot handle this
+            bits = (struct pl_bit_encoding) {0};
+            break;
+        }
+
+        bits = cbits;
+    }
+    mpi->params.repr.bits = bits;
+}
+
+void mp_image_setfmt(struct mp_image *mpi, enum mp_imgfmt fmt)
+{
+    mp_image_sethwfmt(mpi, fmt, IMGFMT_NONE);
 }
 
 static void mp_image_destructor(void *ptr)
@@ -212,6 +244,7 @@ static void mp_image_destructor(void *ptr)
     for (int n = 0; n < mpi->num_ff_side_data; n++)
         av_buffer_unref(&mpi->ff_side_data[n].buf);
     talloc_free(mpi->ff_side_data);
+    mp_image_unrefp(&mpi->enhancement_layer);
 }
 
 int mp_chroma_div_up(int size, int shift)
@@ -234,7 +267,7 @@ int mp_image_plane_h(struct mp_image *mpi, int plane)
 // Caller has to make sure this doesn't exceed the allocated plane data/strides.
 void mp_image_set_size(struct mp_image *mpi, int w, int h)
 {
-    assert(w >= 0 && h >= 0);
+    mp_assert(w >= 0 && h >= 0);
     mpi->w = mpi->params.w = w;
     mpi->h = mpi->params.h = h;
 }
@@ -290,8 +323,8 @@ struct mp_image *mp_image_new_copy(struct mp_image *img)
 // Only works with ref-counted images, and can't change image size/format.
 void mp_image_steal_data(struct mp_image *dst, struct mp_image *src)
 {
-    assert(dst->imgfmt == src->imgfmt && dst->w == src->w && dst->h == src->h);
-    assert(dst->bufs[0] && src->bufs[0]);
+    mp_assert(dst->imgfmt == src->imgfmt && dst->w == src->w && dst->h == src->h);
+    mp_assert(dst->bufs[0] && src->bufs[0]);
 
     mp_image_destructor(dst); // unref old
     talloc_free_children(dst);
@@ -349,6 +382,9 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
     for (int n = 0; n < new->num_ff_side_data; n++)
         ref_buffer(&new->ff_side_data[n].buf);
 
+    new->enhancement_layer = img->enhancement_layer
+        ? mp_image_new_ref(img->enhancement_layer) : NULL;
+
     return new;
 }
 
@@ -382,6 +418,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
     new->film_grain = NULL;
     new->num_ff_side_data = 0;
     new->ff_side_data = NULL;
+    new->enhancement_layer = NULL;
     return new;
 }
 
@@ -432,7 +469,7 @@ bool mp_image_make_writeable(struct mp_image *img)
     if (!new)
         return false;
     mp_image_steal_data(img, new);
-    assert(mp_image_is_writeable(img));
+    mp_assert(mp_image_is_writeable(img));
     return true;
 }
 
@@ -475,9 +512,9 @@ void memcpy_pic(void *dst, const void *src, int bytesPerLine, int height,
 
 void mp_image_copy(struct mp_image *dst, struct mp_image *src)
 {
-    assert(dst->imgfmt == src->imgfmt);
-    assert(dst->w == src->w && dst->h == src->h);
-    assert(mp_image_is_writeable(dst));
+    mp_assert(dst->imgfmt == src->imgfmt);
+    mp_assert(dst->w == src->w && dst->h == src->h);
+    mp_assert(mp_image_is_writeable(dst));
     for (int n = 0; n < dst->num_planes; n++) {
         int line_bytes = (mp_image_plane_w(dst, n) * dst->fmt.bpp[n] + 7) / 8;
         int plane_h = mp_image_plane_h(dst, n);
@@ -491,7 +528,12 @@ void mp_image_copy(struct mp_image *dst, struct mp_image *src)
 static enum pl_color_system mp_image_params_get_forced_csp(struct mp_image_params *params)
 {
     int imgfmt = params->hw_subfmt ? params->hw_subfmt : params->imgfmt;
-    return mp_imgfmt_get_forced_csp(imgfmt);
+    enum pl_color_system csp = mp_imgfmt_get_forced_csp(imgfmt);
+
+    if (csp == PL_COLOR_SYSTEM_RGB && params->repr.sys == PL_COLOR_SYSTEM_XYZ)
+        csp = PL_COLOR_SYSTEM_XYZ;
+
+    return csp;
 }
 
 static void assign_bufref(AVBufferRef **dst, AVBufferRef *new)
@@ -505,13 +547,14 @@ static void assign_bufref(AVBufferRef **dst, AVBufferRef *new)
 
 void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
 {
-    assert(dst != src);
+    mp_assert(dst != src);
 
     dst->pict_type = src->pict_type;
     dst->fields = src->fields;
     dst->pts = src->pts;
     dst->dts = src->dts;
     dst->pkt_duration = src->pkt_duration;
+    dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;
     dst->params.p_w = src->params.p_w;
@@ -522,6 +565,11 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->params.chroma_location = src->params.chroma_location;
     dst->params.crop = src->params.crop;
     dst->nominal_fps = src->nominal_fps;
+    dst->params.primaries_orig = src->params.primaries_orig;
+    dst->params.transfer_orig = src->params.transfer_orig;
+    dst->params.sys_orig = src->params.sys_orig;
+    dst->params.no_dovi = src->params.no_dovi;
+    dst->params.no_enhancement_layer = src->params.no_enhancement_layer;
 
     // ensure colorspace consistency
     enum pl_color_system dst_forced_csp = mp_image_params_get_forced_csp(&dst->params);
@@ -553,17 +601,19 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
         dst->ff_side_data[n].buf = av_buffer_ref(src->ff_side_data[n].buf);
         MP_HANDLE_OOM(dst->ff_side_data[n].buf);
     }
+
+    mp_image_setrefp(&dst->enhancement_layer, src->enhancement_layer);
 }
 
 // Crop the given image to (x0, y0)-(x1, y1) (bottom/right border exclusive)
 // x0/y0 must be naturally aligned.
 void mp_image_crop(struct mp_image *img, int x0, int y0, int x1, int y1)
 {
-    assert(x0 >= 0 && y0 >= 0);
-    assert(x0 <= x1 && y0 <= y1);
-    assert(x1 <= img->w && y1 <= img->h);
-    assert(!(x0 & (img->fmt.align_x - 1)));
-    assert(!(y0 & (img->fmt.align_y - 1)));
+    mp_assert(x0 >= 0 && y0 >= 0);
+    mp_assert(x0 <= x1 && y0 <= y1);
+    mp_assert(x1 <= img->w && y1 <= img->h);
+    mp_assert(!(x0 & (img->fmt.align_x - 1)));
+    mp_assert(!(y0 & (img->fmt.align_y - 1)));
 
     for (int p = 0; p < img->num_planes; ++p) {
         img->planes[p] += (y0 >> img->fmt.ys[p]) * img->stride[p] +
@@ -580,7 +630,7 @@ void mp_image_crop_rc(struct mp_image *img, struct mp_rect rc)
 // Repeatedly write count patterns of src[0..src_size] to p.
 static void memset_pattern(void *p, size_t count, uint8_t *src, size_t src_size)
 {
-    assert(src_size >= 1);
+    mp_assert(src_size >= 1);
 
     if (src_size == 1) {
         memset(p, src[0], count);
@@ -627,11 +677,11 @@ static bool endian_swap_bytes(void *d, size_t bytes, size_t word_size)
 // Alpha is cleared to 0 (fully transparent).
 void mp_image_clear(struct mp_image *img, int x0, int y0, int x1, int y1)
 {
-    assert(x0 >= 0 && y0 >= 0);
-    assert(x0 <= x1 && y0 <= y1);
-    assert(x1 <= img->w && y1 <= img->h);
-    assert(!(x0 & (img->fmt.align_x - 1)));
-    assert(!(y0 & (img->fmt.align_y - 1)));
+    mp_assert(x0 >= 0 && y0 >= 0);
+    mp_assert(x0 <= x1 && y0 <= y1);
+    mp_assert(x1 <= img->w && y1 <= img->h);
+    mp_assert(!(x0 & (img->fmt.align_x - 1)));
+    mp_assert(!(y0 & (img->fmt.align_y - 1)));
 
     struct mp_image area = *img;
     struct mp_imgfmt_desc *fmt = &area.fmt;
@@ -807,6 +857,11 @@ bool mp_image_params_valid(const struct mp_image_params *p)
     if (p->w <= 0 || p->h <= 0 || (p->w + 128LL) * (p->h + 128LL) >= INT_MAX / 8)
         return false;
 
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    if (p->w > 16384 || p->h > 16384 || p->w * p->h > 2048 * 2048)
+        return false;
+#endif
+
     if (p->p_w < 0 || p->p_h < 0)
         return false;
 
@@ -835,6 +890,7 @@ bool mp_image_params_equal(const struct mp_image_params *p1,
            pl_color_repr_equal(&p1->repr, &p2->repr) &&
            p1->light == p2->light &&
            p1->chroma_location == p2->chroma_location &&
+           p1->vflip == p2->vflip &&
            p1->rotate == p2->rotate &&
            p1->stereo3d == p2->stereo3d &&
            mp_rect_equals(&p1->crop, &p2->crop);
@@ -849,6 +905,38 @@ bool mp_image_params_static_equal(const struct mp_image_params *p1,
     a.repr.dovi = b.repr.dovi = NULL;
     a.color.hdr = b.color.hdr = (struct pl_hdr_metadata){0};
     return mp_image_params_equal(&a, &b);
+}
+
+void mp_image_params_update_dynamic(struct mp_image_params *dst,
+                                    const struct mp_image_params *src,
+                                    bool has_peak_detect_values)
+{
+    dst->repr.dovi = src->repr.dovi;
+    // Don't overwrite peak-detected HDR metadata if available.
+    struct pl_hdr_metadata *hdr = &dst->color.hdr;
+    const struct pl_hdr_metadata prev = *hdr;
+    *hdr = src->color.hdr;
+    if (has_peak_detect_values) {
+        hdr->max_pq_y  = prev.max_pq_y;
+        hdr->avg_pq_y  = prev.avg_pq_y;
+        hdr->scene_avg = prev.scene_avg;
+        memcpy(hdr->scene_max, prev.scene_max, sizeof(hdr->scene_max));
+    }
+}
+
+// Restore color system, transfer, and primaries to their original values
+// before dovi mapping.
+void mp_image_params_restore_dovi_mapping(struct mp_image_params *params)
+{
+    if (params->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+        return;
+    params->color.primaries = params->primaries_orig;
+    params->color.transfer = params->transfer_orig;
+    params->repr.sys = params->sys_orig;
+    if (!pl_color_transfer_is_hdr(params->transfer_orig))
+        params->color.hdr = (struct pl_hdr_metadata){0};
+    if (params->transfer_orig != PL_COLOR_TRC_PQ)
+        params->color.hdr.max_pq_y = params->color.hdr.avg_pq_y = 0;
 }
 
 // Set most image parameters, but not image format or size.
@@ -910,8 +998,10 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
             params->repr.sys != PL_COLOR_SYSTEM_BT_2100_HLG &&
             params->repr.sys != PL_COLOR_SYSTEM_DOLBYVISION &&
             params->repr.sys != PL_COLOR_SYSTEM_SMPTE_240M &&
-            params->repr.sys != PL_COLOR_SYSTEM_YCGCO)
-        {
+            params->repr.sys != PL_COLOR_SYSTEM_YCGCO &&
+            params->repr.sys != PL_COLOR_SYSTEM_YCGCO_RE &&
+            params->repr.sys != PL_COLOR_SYSTEM_YCGCO_RO
+        ) {
             // Makes no sense, so guess instead
             // YCGCO should be separate, but libavcodec disagrees
             params->repr.sys = PL_COLOR_SYSTEM_UNKNOWN;
@@ -938,7 +1028,8 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
             }
         }
         if (params->color.transfer == PL_COLOR_TRC_UNKNOWN)
-            params->color.transfer = PL_COLOR_TRC_BT_1886;
+            params->color.transfer = params->repr.levels == PL_COLOR_LEVELS_LIMITED ?
+                                        PL_COLOR_TRC_BT_1886 : PL_COLOR_TRC_SRGB;
     } else if (forced_csp == PL_COLOR_SYSTEM_RGB) {
         params->repr.sys = PL_COLOR_SYSTEM_RGB;
         params->repr.levels = PL_COLOR_LEVELS_FULL;
@@ -955,10 +1046,17 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
     } else if (forced_csp == PL_COLOR_SYSTEM_XYZ) {
         params->repr.sys = PL_COLOR_SYSTEM_XYZ;
         params->repr.levels = PL_COLOR_LEVELS_FULL;
-        // Force gamma to ST428 as this is the only correct for DCDM X'Y'Z'
-        params->color.transfer = PL_COLOR_TRC_ST428;
-        // Don't care about primaries, they shouldn't be used, or if anything
-        // MP_CSP_PRIM_ST428 should be defined.
+        if (params->color.transfer == PL_COLOR_TRC_LINEAR) {
+            // Linear light XYZ is decoded into the tagged primaries
+            if (params->color.primaries == PL_COLOR_PRIM_UNKNOWN)
+                params->color.primaries = PL_COLOR_PRIM_BT_2020;
+        } else {
+            // Anything else is DCDM X'Y'Z' (ST 428-1) by default.
+            if (params->color.transfer == PL_COLOR_TRC_UNKNOWN)
+                params->color.transfer = PL_COLOR_TRC_ST428;
+            if (params->color.primaries == PL_COLOR_PRIM_UNKNOWN)
+                params->color.primaries = PL_COLOR_PRIM_DCI_P3;
+        }
     } else {
         // We have no clue.
         params->repr.sys = PL_COLOR_SYSTEM_UNKNOWN;
@@ -967,15 +1065,9 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
         params->color.transfer = PL_COLOR_TRC_UNKNOWN;
     }
 
-    if (!params->color.hdr.max_luma) {
-        if (params->color.transfer == PL_COLOR_TRC_HLG) {
-            params->color.hdr.max_luma = 1000; // reference display
-        } else {
-            // If the signal peak is unknown, we're forced to pick the TRC's
-            // nominal range as the signal peak to prevent clipping
-            params->color.hdr.max_luma = pl_color_transfer_nominal_peak(params->color.transfer) * MP_REF_WHITE;
-        }
-    }
+    // If the signal peak is unknown, we're forced to pick the TRC's
+    // nominal range as the signal peak to prevent clipping
+    pl_color_space_infer(&params->color);
 
     if (!pl_color_space_is_hdr(&params->color)) {
         // Some clips have leftover HDR metadata after conversion to SDR, so to
@@ -983,11 +1075,16 @@ void mp_image_params_guess_csp(struct mp_image_params *params)
         params->color.hdr = pl_hdr_metadata_empty;
     }
 
-    if (params->chroma_location == PL_CHROMA_UNKNOWN) {
-        if (params->repr.levels == PL_COLOR_LEVELS_LIMITED)
-            params->chroma_location = PL_CHROMA_LEFT;
-        if (params->repr.levels == PL_COLOR_LEVELS_FULL)
-            params->chroma_location = PL_CHROMA_CENTER;
+    if (mp_imgfmt_is_subsampled(params->hw_subfmt ? params->hw_subfmt : params->imgfmt)) {
+        if (params->chroma_location == PL_CHROMA_UNKNOWN) {
+            if (params->repr.levels == PL_COLOR_LEVELS_LIMITED)
+                params->chroma_location = PL_CHROMA_LEFT;
+            if (params->repr.levels == PL_COLOR_LEVELS_FULL)
+                params->chroma_location = PL_CHROMA_CENTER;
+        }
+    } else {
+        // Set to center for non-subsampled formats.
+        params->chroma_location = PL_CHROMA_CENTER;
     }
 
     if (params->light == MP_CSP_LIGHT_AUTO) {
@@ -1012,7 +1109,12 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
 
     dst->hwctx = src->hw_frames_ctx;
 
-    mp_image_setfmt(dst, pixfmt2imgfmt(src->format));
+    if (dst->hwctx) {
+        AVHWFramesContext *fctx = (void *)dst->hwctx->data;
+        dst->params.hw_subfmt = pixfmt2imgfmt(fctx->sw_format);
+    }
+
+    mp_image_sethwfmt(dst, pixfmt2imgfmt(src->format), dst->params.hw_subfmt);
     mp_image_set_size(dst, src->width, src->height);
 
     dst->params.p_w = src->sample_aspect_ratio.num;
@@ -1031,24 +1133,15 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     dst->params.crop.y1 = src->height - src->crop_bottom;
 
     dst->fields = 0;
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
     if (src->flags & AV_FRAME_FLAG_INTERLACED)
         dst->fields |= MP_IMGFIELD_INTERLACED;
     if (src->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST)
         dst->fields |= MP_IMGFIELD_TOP_FIRST;
-#else
-    if (src->interlaced_frame)
-        dst->fields |= MP_IMGFIELD_INTERLACED;
-    if (src->top_field_first)
-        dst->fields |= MP_IMGFIELD_TOP_FIRST;
-#endif
     if (src->repeat_pict == 1)
         dst->fields |= MP_IMGFIELD_REPEAT_FIRST;
 
-    dst->params.repr = (struct pl_color_repr){
-        .sys = pl_system_from_av(src->colorspace),
-        .levels = pl_levels_from_av(src->color_range),
-    };
+    dst->params.repr.sys = pl_system_from_av(src->colorspace);
+    dst->params.repr.levels = pl_levels_from_av(src->color_range);
 
     dst->params.color = (struct pl_color_space){
         .primaries = pl_primaries_from_av(src->color_primaries),
@@ -1057,19 +1150,39 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
 
     dst->params.chroma_location = pl_chroma_from_av(src->chroma_location);
 
+    sd = av_frame_get_side_data(src, AV_FRAME_DATA_STEREO3D);
+    if (sd)
+        dst->params.stereo3d = mp_stereo3d_from_av((const AVStereo3D *)sd->data);
+
     if (src->opaque_ref) {
         struct mp_image_params *p = (void *)src->opaque_ref->data;
         dst->params.stereo3d = p->stereo3d;
         // Might be incorrect if colorspace changes.
         dst->params.light = p->light;
+        dst->params.no_dovi = p->no_dovi;
+        dst->params.no_enhancement_layer = p->no_enhancement_layer;
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 11, 100)
         dst->params.repr.alpha = p->repr.alpha;
+#endif
     }
+
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 11, 100)
+    // mp_image_setfmt sets to PL_ALPHA_INDEPENDENT, if format has alpha.
+    if (dst->params.repr.alpha == PL_ALPHA_INDEPENDENT)
+        dst->params.repr.alpha = pl_alpha_from_av(src->alpha_mode);
+#endif
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_DISPLAYMATRIX);
     if (sd) {
-        double r = av_display_rotation_get((int32_t *)(sd->data));
-        if (!isnan(r))
+        int32_t *matrix = (int32_t *) sd->data;
+        // determinant
+        int vflip = ((int64_t)matrix[0] * (int64_t)matrix[4]
+                    - (int64_t)matrix[1] * (int64_t)matrix[3]) < 0;
+        double r = av_display_rotation_get(matrix);
+        if (!isnan(r)) {
             dst->params.rotate = (((int)(-r) % 360) + 360) % 360;
+            dst->params.vflip = vflip;
+        }
     }
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_ICC_PROFILE);
@@ -1089,39 +1202,26 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
     if (sd)
         dst->a53_cc = sd->buf;
 
+    dst->params.primaries_orig = dst->params.color.primaries;
+    dst->params.transfer_orig = dst->params.color.transfer;
+    dst->params.sys_orig = dst->params.repr.sys;
     AVBufferRef *dovi = NULL;
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 16, 100)
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_METADATA);
     if (sd) {
 #ifdef PL_HAVE_LAV_DOLBY_VISION
         const AVDOVIMetadata *metadata = (const AVDOVIMetadata *)sd->buf->data;
-        const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
-        if (header->disable_residual_flag) {
-            dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
-            MP_HANDLE_OOM(dovi);
-#if PL_API_VER >= 343
-            pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,
-                                   (void *)dst->dovi->data, metadata);
-#else
-            struct pl_frame frame;
-            frame.repr = dst->params.repr;
-            frame.color = dst->params.color;
-            pl_frame_map_avdovi_metadata(&frame, (void *)dst->dovi->data, metadata);
-            dst->params.repr = frame.repr;
-            dst->params.color = frame.color;
-#endif
-        }
+        dst->dovi = dovi = av_buffer_alloc(sizeof(struct pl_dovi_metadata));
+        MP_HANDLE_OOM(dovi);
+        pl_map_avdovi_metadata(&dst->params.color, &dst->params.repr,
+                               (void *)dst->dovi->data, metadata);
 #endif
     }
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_DOVI_RPU_BUFFER);
     if (sd) {
-#ifdef PL_HAVE_LIBDOVI
         pl_hdr_metadata_from_dovi_rpu(&dst->params.color.hdr, sd->buf->data,
                                       sd->buf->size);
-#endif
     }
-#endif
 
     sd = av_frame_get_side_data(src, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
     if (sd)
@@ -1134,11 +1234,6 @@ struct mp_image *mp_image_from_av_frame(struct AVFrame *src)
             .buf = sd->buf,
         };
         MP_TARRAY_APPEND(NULL, dst->ff_side_data, dst->num_ff_side_data, mpsd);
-    }
-
-    if (dst->hwctx) {
-        AVHWFramesContext *fctx = (void *)dst->hwctx->data;
-        dst->params.hw_subfmt = pixfmt2imgfmt(fctx->sw_format);
     }
 
     struct mp_image *res = mp_image_new_ref(dst);
@@ -1189,27 +1284,23 @@ struct AVFrame *mp_image_to_av_frame(struct mp_image *src)
     dst->extended_data = dst->data;
 
     dst->pict_type = src->pict_type;
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 7, 100)
     if (src->fields & MP_IMGFIELD_INTERLACED)
         dst->flags |= AV_FRAME_FLAG_INTERLACED;
     if (src->fields & MP_IMGFIELD_TOP_FIRST)
         dst->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
-#else
-    if (src->fields & MP_IMGFIELD_INTERLACED)
-        dst->interlaced_frame = 1;
-    if (src->fields & MP_IMGFIELD_TOP_FIRST)
-        dst->top_field_first = 1;
-#endif
     if (src->fields & MP_IMGFIELD_REPEAT_FIRST)
         dst->repeat_pict = 1;
 
-    pl_avframe_set_repr(dst, src->params.repr);
+    // Image params without dovi mapped; should be passed as side data instead
+    struct mp_image_params params = src->params;
+    mp_image_params_restore_dovi_mapping(&params);
+    pl_avframe_set_repr(dst, params.repr);
 
-    dst->chroma_location = pl_chroma_to_av(src->params.chroma_location);
+    dst->chroma_location = pl_chroma_to_av(params.chroma_location);
 
     dst->opaque_ref = av_buffer_alloc(sizeof(struct mp_image_params));
     MP_HANDLE_OOM(dst->opaque_ref);
-    *(struct mp_image_params *)dst->opaque_ref->data = src->params;
+    *(struct mp_image_params *)dst->opaque_ref->data = params;
 
     if (src->icc_profile) {
         AVFrameSideData *sd =
@@ -1219,14 +1310,14 @@ struct AVFrame *mp_image_to_av_frame(struct mp_image *src)
         new_ref->icc_profile = NULL;
     }
 
-    pl_avframe_set_color(dst, src->params.color);
+    pl_avframe_set_color(dst, params.color);
 
     {
         AVFrameSideData *sd = av_frame_new_side_data(dst,
                                                      AV_FRAME_DATA_DISPLAYMATRIX,
                                                      sizeof(int32_t) * 9);
         MP_HANDLE_OOM(sd);
-        av_display_rotation_set((int32_t *)sd->data, src->params.rotate);
+        av_display_rotation_set((int32_t *)sd->data, params.rotate);
     }
 
     // Add back side data, but only for types which are not specially handled
@@ -1290,8 +1381,8 @@ void memset16_pic(void *dst, int fill, int unitsPerLine, int height, int stride)
 // You cannot access e.g. individual luma pixels on the luma plane with yuv420p.
 void *mp_image_pixel_ptr(struct mp_image *img, int plane, int x, int y)
 {
-    assert(MP_IS_ALIGNED(x, img->fmt.align_x));
-    assert(MP_IS_ALIGNED(y, img->fmt.align_y));
+    mp_assert(MP_IS_ALIGNED(x, img->fmt.align_x));
+    mp_assert(MP_IS_ALIGNED(y, img->fmt.align_y));
     return mp_image_pixel_ptr_ny(img, plane, x, y);
 }
 
@@ -1300,8 +1391,8 @@ void *mp_image_pixel_ptr(struct mp_image *img, int plane, int x, int y)
 // Useful for addressing luma rows.
 void *mp_image_pixel_ptr_ny(struct mp_image *img, int plane, int x, int y)
 {
-    assert(MP_IS_ALIGNED(x, img->fmt.align_x));
-    assert(MP_IS_ALIGNED(y, 1 << img->fmt.ys[plane]));
+    mp_assert(MP_IS_ALIGNED(x, img->fmt.align_x));
+    mp_assert(MP_IS_ALIGNED(y, 1 << img->fmt.ys[plane]));
     return img->planes[plane] +
            img->stride[plane] * (ptrdiff_t)(y >> img->fmt.ys[plane]) +
            (x >> img->fmt.xs[plane]) * (size_t)img->fmt.bpp[plane] / 8;

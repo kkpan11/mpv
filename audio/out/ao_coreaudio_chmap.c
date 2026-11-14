@@ -28,6 +28,7 @@ static const int speaker_map[][2] = {
     { kAudioChannelLabel_Left,                 MP_SPEAKER_ID_FL   },
     { kAudioChannelLabel_Right,                MP_SPEAKER_ID_FR   },
     { kAudioChannelLabel_Center,               MP_SPEAKER_ID_FC   },
+    { kAudioChannelLabel_Mono,                 MP_SPEAKER_ID_FC   },
     { kAudioChannelLabel_LFEScreen,            MP_SPEAKER_ID_LFE  },
     { kAudioChannelLabel_LeftSurround,         MP_SPEAKER_ID_BL   },
     { kAudioChannelLabel_RightSurround,        MP_SPEAKER_ID_BR   },
@@ -297,9 +298,9 @@ AudioChannelLayout *ca_find_standard_layout(void *talloc_ctx, AudioChannelLayout
         if (l->mNumberChannelDescriptions != r->mNumberChannelDescriptions)
             goto mismatch;
 
-        for (int i = 0; i < l->mNumberChannelDescriptions; ++i) {
-            AudioChannelDescription *ld = l->mChannelDescriptions + i;
-            AudioChannelDescription *rd = r->mChannelDescriptions + i;
+        for (int j = 0; j < l->mNumberChannelDescriptions; ++j) {
+            AudioChannelDescription *ld = l->mChannelDescriptions + j;
+            AudioChannelDescription *rd = r->mChannelDescriptions + j;
             if (ld->mChannelLabel == rd->mChannelLabel)
                 continue;
             // XXX: we cannot handle channels with coordinates
@@ -314,6 +315,30 @@ mismatch:;
     return s ? s : l;
 }
 
+AudioChannelLayout *ca_get_acl(struct ao *ao, size_t *out_layout_size)
+{
+    size_t layout_size = sizeof(AudioChannelLayout)
+                         + (ao->channels.num - 1) * sizeof(AudioChannelDescription);
+    AudioChannelLayout *layout = talloc_size(ao, layout_size);
+    layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
+    layout->mNumberChannelDescriptions = ao->channels.num;
+    for (int i = 0; i < ao->channels.num; ++i) {
+        AudioChannelDescription *desc = layout->mChannelDescriptions + i;
+        desc->mChannelFlags = kAudioChannelFlags_AllOff;
+        desc->mChannelLabel = mp_speaker_id_to_ca_label(ao->channels.speaker[i]);
+    }
+
+    void *talloc_ctx = talloc_new(NULL);
+    AudioChannelLayout *std_layout = ca_find_standard_layout(talloc_ctx, layout);
+    memmove(layout, std_layout, sizeof(AudioChannelLayout));
+    talloc_free(talloc_ctx);
+    ca_log_layout(ao, MSGL_V, layout);
+
+    if (out_layout_size)
+        *out_layout_size = layout_size;
+    return layout;
+}
+
 
 #define CHMAP(n, ...) &(struct mp_chmap) MP_CONCAT(MP_CHMAP, n) (__VA_ARGS__)
 
@@ -324,7 +349,7 @@ static void replace_submap(struct mp_chmap *dst, struct mp_chmap *a,
     struct mp_chmap t = *dst;
     if (!mp_chmap_is_valid(&t) || mp_chmap_diffn(a, &t) != 0)
         return;
-    assert(a->num == b->num);
+    mp_assert(a->num == b->num);
     for (int n = 0; n < t.num; n++) {
         for (int i = 0; i < a->num; i++) {
             if (t.speaker[n] == a->speaker[i]) {
@@ -352,7 +377,7 @@ static bool ca_layout_to_mp_chmap(struct ao *ao, AudioChannelLayout *layout,
     if (l->mNumberChannelDescriptions > MP_NUM_CHANNELS) {
         MP_VERBOSE(ao, "layout has too many descriptions (%u, max: %d)\n",
                    (unsigned) l->mNumberChannelDescriptions, MP_NUM_CHANNELS);
-        return false;
+        goto coreaudio_error;
     }
 
     chmap->num = l->mNumberChannelDescriptions;
@@ -413,7 +438,6 @@ static AudioChannelLayout* ca_query_stereo_layout(struct ao *ao,
 {
     OSStatus err;
     uint32_t channels[2];
-    const int nch = MP_ARRAY_SIZE(channels);
     AudioChannelLayout *r = NULL;
 
     AudioObjectPropertyAddress p_addr = (AudioObjectPropertyAddress) {
@@ -426,18 +450,26 @@ static AudioChannelLayout* ca_query_stereo_layout(struct ao *ao,
     err = AudioObjectGetPropertyData(device, &p_addr, 0, NULL, &psize, channels);
     CHECK_CA_ERROR("could not get device preferred stereo layout");
 
+    uint32_t left = channels[0], right = channels[1];
+    if (!left || !right || left == right || left > MP_NUM_CHANNELS || right > MP_NUM_CHANNELS) {
+        MP_VERBOSE(ao, "ignoring invalid preferred stereo layout [%u,%u]\n", left, right);
+        goto coreaudio_error;
+    }
+
+    MP_VERBOSE(ao, "found valid preferred stereo layout [%u,%u]\n", left, right);
+
+    uint32_t nch = MPMAX(left, right);
     psize = sizeof(AudioChannelLayout) + nch * sizeof(AudioChannelDescription);
     r = talloc_zero_size(talloc_ctx, psize);
     r->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
     r->mNumberChannelDescriptions = nch;
 
-    AudioChannelDescription desc = {0};
-    desc.mChannelFlags = kAudioChannelFlags_AllOff;
-
-    for(int i = 0; i < nch; i++) {
-        desc.mChannelLabel = channels[i];
-        r->mChannelDescriptions[i] = desc;
+    for (uint32_t i = 0; i < nch; i++) {
+        r->mChannelDescriptions[i].mChannelFlags = kAudioChannelFlags_AllOff;
+        r->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Unknown;
     }
+    r->mChannelDescriptions[left - 1].mChannelLabel = kAudioChannelLabel_Left;
+    r->mChannelDescriptions[right - 1].mChannelLabel = kAudioChannelLabel_Right;
 
 coreaudio_error:
     return r;
@@ -449,12 +481,12 @@ static void ca_retrieve_layouts(struct ao *ao, struct mp_chmap_sel *s,
     void *ta_ctx = talloc_new(NULL);
     struct mp_chmap chmap;
 
-    AudioChannelLayout *ml = ca_query_layout(ao, device, ta_ctx);
-    if (ml && ca_layout_to_mp_chmap(ao, ml, &chmap))
-        mp_chmap_sel_add_map(s, &chmap);
-
     AudioChannelLayout *sl = ca_query_stereo_layout(ao, device, ta_ctx);
     if (sl && ca_layout_to_mp_chmap(ao, sl, &chmap))
+        mp_chmap_sel_add_map(s, &chmap);
+
+    AudioChannelLayout *ml = ca_query_layout(ao, device, ta_ctx);
+    if (ml && ca_layout_to_mp_chmap(ao, ml, &chmap))
         mp_chmap_sel_add_map(s, &chmap);
 
     talloc_free(ta_ctx);
@@ -467,8 +499,6 @@ bool ca_init_chmap(struct ao *ao, AudioDeviceID device)
 
     if (!chmap_sel.num_chmaps)
         mp_chmap_sel_add_map(&chmap_sel, &(struct mp_chmap)MP_CHMAP_INIT_STEREO);
-
-    mp_chmap_sel_add_map(&chmap_sel, &(struct mp_chmap)MP_CHMAP_INIT_MONO);
 
     if (!ao_chmap_sel_adjust(ao, &chmap_sel, &ao->channels)) {
         MP_ERR(ao, "could not select a suitable channel map among the "

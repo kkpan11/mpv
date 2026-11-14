@@ -44,7 +44,7 @@ static void apply_autofit(int *w, int *h, int scr_w, int scr_h,
 
     int dummy = 0;
     int n_w = *w, n_h = *h;
-    m_geometry_apply(&dummy, &dummy, &n_w, &n_h, scr_w, scr_h, geo);
+    m_geometry_apply(&dummy, &dummy, &n_w, &n_h, scr_w, scr_h, true, geo);
 
     if (!allow_up && *w <= n_w && *h <= n_h)
         return;
@@ -57,9 +57,9 @@ static void apply_autofit(int *w, int *h, int scr_w, int scr_h,
     double n_asp = (double)n_w / n_h;
     if ((n_asp <= asp) == allow_down) {
         *w = n_w;
-        *h = n_w / asp;
+        *h = MPMAX(n_w / asp, 1);
     } else {
-        *w = n_h * asp;
+        *w = MPMAX(n_h * asp, 1);
         *h = n_h;
     }
 }
@@ -69,20 +69,28 @@ static void apply_autofit(int *w, int *h, int scr_w, int scr_h,
 // Does not change *vo.
 //  screen: position of the area on virtual desktop on which the video-content
 //          should be placed (maybe after excluding decorations, taskbars, etc)
+//          can be the same as monitor for platforms that don't try to take into
+//          account decorations, taskbars, etc.
 //  monitor: position of the monitor on virtual desktop (used for pixelaspect).
 //  dpi_scale: the DPI multiplier to get from virtual to real coordinates
 //             (>1 for "hidpi")
+//  force_pos: force window position even if opts->force_window_position is not
+//             set. If geometry x/y is not valid, this will center the window.
+//             Useful for initial window placement.
+//  size_constraint: if non-NULL, the resulting size will be limited by the size
+//                   specified in this geometry. This applies to both autofit
+//                   and geometry options.
 // Use vo_apply_window_geometry() to copy the result into the vo.
 // NOTE: currently, all windowing backends do their own handling of window
 //       geometry additional to this code. This is to deal with initial window
 //       placement, fullscreen handling, avoiding resize on reconfig() with no
 //       size change, multi-monitor stuff, and possibly more.
-void vo_calc_window_geometry3(struct vo *vo, const struct mp_rect *screen,
-                              const struct mp_rect *monitor,
-                              double dpi_scale, struct vo_win_geometry *out_geo)
+void vo_calc_window_geometry(struct vo *vo, struct mp_vo_opts *opts,
+                             const struct mp_rect *screen,
+                             const struct mp_rect *monitor, double dpi_scale,
+                             bool force_pos, struct vo_win_geometry *out_geo,
+                             struct m_geometry *size_constraint)
 {
-    struct mp_vo_opts *opts = vo->opts;
-
     *out_geo = (struct vo_win_geometry){0};
 
     // The case of calling this function even though no video was configured
@@ -116,32 +124,32 @@ void vo_calc_window_geometry3(struct vo *vo, const struct mp_rect *screen,
     apply_autofit(&d_w, &d_h, scr_w, scr_h, &opts->autofit, true, true);
     apply_autofit(&d_w, &d_h, scr_w, scr_h, &opts->autofit_smaller, true, false);
     apply_autofit(&d_w, &d_h, scr_w, scr_h, &opts->autofit_larger, false, true);
+    if (size_constraint)
+        apply_autofit(&d_w, &d_h, scr_w, scr_h, size_constraint, false, true);
 
     out_geo->win.x0 = (int)(scr_w - d_w) / 2;
     out_geo->win.y0 = (int)(scr_h - d_h) / 2;
+
+    bool center = (opts->force_window_position || force_pos) && !opts->geometry.xy_valid;
     m_geometry_apply(&out_geo->win.x0, &out_geo->win.y0, &d_w, &d_h,
-                     scr_w, scr_h, &opts->geometry);
+                     scr_w, scr_h, center, &opts->geometry);
+
+    if (size_constraint) {
+        int old_w = d_w, old_h = d_h;
+        apply_autofit(&d_w, &d_h, scr_w, scr_h, size_constraint, false, true);
+        if (!opts->geometry.xy_valid) {
+            out_geo->win.x0 += (old_w - d_w) / 2;
+            out_geo->win.y0 += (old_h - d_h) / 2;
+        }
+    }
 
     out_geo->win.x0 += screen->x0;
     out_geo->win.y0 += screen->y0;
     out_geo->win.x1 = out_geo->win.x0 + d_w;
     out_geo->win.y1 = out_geo->win.y0 + d_h;
 
-    if (opts->geometry.xy_valid || opts->force_window_position)
+    if (opts->force_window_position || force_pos)
         out_geo->flags |= VO_WIN_FORCE_POS;
-}
-
-// same as vo_calc_window_geometry3 with monitor assumed same as screen
-void vo_calc_window_geometry2(struct vo *vo, const struct mp_rect *screen,
-                              double dpi_scale, struct vo_win_geometry *out_geo)
-{
-    vo_calc_window_geometry3(vo, screen, screen, dpi_scale, out_geo);
-}
-
-void vo_calc_window_geometry(struct vo *vo, const struct mp_rect *screen,
-                             struct vo_win_geometry *out_geo)
-{
-    vo_calc_window_geometry2(vo, screen, 1.0, out_geo);
 }
 
 // Copy the parameters in *geo to the vo fields.

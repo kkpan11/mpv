@@ -25,7 +25,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <unistd.h>
 
 #include <sys/ioctl.h>
 #include <sys/soundcard.h>
@@ -113,7 +112,7 @@ static void device_descr_get(size_t dev_idx, char *buf, size_t buf_size)
     mixer_info mi;
 
     snprintf(dev_path, sizeof(dev_path), PATH_DEV_MIXER"%zu", dev_idx);
-    int fd = open(dev_path, O_RDONLY);
+    int fd = open(dev_path, O_RDONLY | O_CLOEXEC);
     if (ioctl(fd, SOUND_MIXER_INFO, &mi) == 0) {
         strncpy(buf, mi.name, buf_size - 1);
         tmp = (buf_size - 1);
@@ -328,7 +327,7 @@ static bool audio_write(struct ao *ao, void **data, int samples)
 
     while ((rc = write(p->dsp_fd, data[0], size)) == -1) {
         if (errno == EINTR)
-			continue;
+            continue;
         MP_WARN(ao, "audio_write: write() fail, err = %i: %s.\n",
             errno, mp_strerror(errno));
         return false;

@@ -18,12 +18,20 @@
 #ifndef MPLAYER_MPCOMMON_H
 #define MPLAYER_MPCOMMON_H
 
-#include <assert.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 
+#include "config.h"
+
+#if HAVE_POSIX || defined(__MINGW32__)
+#include <strings.h>
+#include <unistd.h>
+#endif
+
+#include "misc/mp_assert.h"
 #include "osdep/compiler.h"
 #include "mpv_talloc.h"
 
@@ -58,6 +66,27 @@
 // Return a+b, unless a is NOPTS. b must not be NOPTS.
 #define MP_ADD_PTS(a, b) ((a) == MP_NOPTS_VALUE ? (a) : ((a) + (b)))
 
+// Return the maximum value representable by integer type of a.
+#define MP_MAX_VAL(a) _Generic((a),                             \
+                               char: SCHAR_MAX,                 \
+                               unsigned char: UCHAR_MAX,        \
+                               short: SHRT_MAX,                 \
+                               unsigned short: USHRT_MAX,       \
+                               int: INT_MAX,                    \
+                               unsigned int: UINT_MAX,          \
+                               long: LONG_MAX,                  \
+                               unsigned long: ULONG_MAX,        \
+                               long long: LLONG_MAX,            \
+                               unsigned long long: ULLONG_MAX)
+
+// Multiply a * b and store in result. If result would overflow, saturate at
+// its maximum value instead, and return true. Otherwise, return false.
+#define MP_SATURATE_MUL(result, a, b) (         \
+    MP_CKD_MUL(result, a, b) ?                  \
+        *result = MP_MAX_VAL(*result), true :   \
+        false                                   \
+)
+
 #define CONTROL_OK 1
 #define CONTROL_TRUE 1
 #define CONTROL_FALSE 0
@@ -82,6 +111,16 @@ enum video_sync {
     VS_DISP_VDROP,
     VS_DISP_NONE,
     VS_NONE,
+};
+
+enum track_flags {
+    // starts at 4, for cmd_track_add backwards compatibility
+    TRACK_HEARING_IMPAIRED = 1 << 2,
+    TRACK_VISUAL_IMPAIRED = 1 << 3,
+    TRACK_ATTACHED_PICTURE = 1 << 4,
+    TRACK_FORCED = 1 << 5,
+    TRACK_DEFAULT = 1 << 6,
+    TRACK_COMMENTARY = 1 << 7,
 };
 
 #define VS_IS_DISP(x) ((x) == VS_DISP_RESAMPLE ||       \
@@ -124,9 +163,10 @@ void mp_rect_rotate(struct mp_rect *rc, int w, int h, int rotation);
 unsigned int mp_log2(uint32_t v);
 uint32_t mp_round_next_power_of_2(uint32_t v);
 int mp_lcm(int x, int y);
+int64_t mp_gcd(int64_t x, int64_t y);
 
 int mp_snprintf_cat(char *str, size_t size, const char *format, ...)
-    PRINTF_ATTRIBUTE(3, 4);
+    MP_PRINTF_ATTRIBUTE(3, 4);
 
 struct bstr;
 
@@ -149,7 +189,7 @@ char *mp_tag_str_buf(char *buf, size_t buf_size, uint32_t tag);
 #define mp_tprintf(SIZE, format, ...) \
     mp_tprintf_buf((char[SIZE]){0}, (SIZE), (format), __VA_ARGS__)
 char *mp_tprintf_buf(char *buf, size_t buf_size, const char *format, ...)
-    PRINTF_ATTRIBUTE(3, 4);
+    MP_PRINTF_ATTRIBUTE(3, 4);
 
 char **mp_dup_str_array(void *tctx, char **s);
 
@@ -159,9 +199,30 @@ char **mp_dup_str_array(void *tctx, char **s);
 // This macro generally behaves like an assert(), except it will make sure to
 // kill the process even with NDEBUG.
 #define MP_HANDLE_OOM(x) do {   \
-        assert(x);              \
-        if (!(x))               \
+        void *oom_p_ = (x);     \
+        if (!oom_p_)            \
             abort();            \
     } while (0)
+
+#ifdef _MSC_VER
+#define strncasecmp _strnicmp
+#define strcasecmp _stricmp
+
+#ifndef STDIN_FILENO
+#define STDIN_FILENO 0
+#endif
+#ifndef STDOUT_FILENO
+#define STDOUT_FILENO 1
+#endif
+#ifndef STDERR_FILENO
+#define STDERR_FILENO 2
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0
+#endif
+
+typedef long long ssize_t;
+typedef unsigned short mode_t;
+#endif
 
 #endif /* MPLAYER_MPCOMMON_H */

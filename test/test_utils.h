@@ -6,8 +6,8 @@
 
 #include "common/common.h"
 
-#define assert_true(x) assert(x)
-#define assert_false(x) assert(!(x))
+#define assert_true(x) mp_require(x)
+#define assert_false(x) mp_require(!(x))
 #define assert_int_equal(a, b) \
     assert_int_equal_impl(__FILE__, __LINE__, (a), (b))
 #define assert_string_equal(a, b) \
@@ -48,7 +48,7 @@ FILE *test_open_out(const char *outdir, const char *name);
 // just define these as stubs that do nothing.
 struct mp_log;
 void mp_msg(struct mp_log *log, int lev, const char *format, ...)
-    PRINTF_ATTRIBUTE(3, 4);
+    MP_PRINTF_ATTRIBUTE(3, 4);
 int mp_msg_find_level(const char *s);
 int mp_msg_level(struct mp_log *log);
 void mp_msg_set_max_level(struct mp_log *log, int lev);

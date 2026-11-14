@@ -21,13 +21,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 #include "common/common.h"
 #include "common/global.h"
 #include "common/msg.h"
 #include "common/msg_control.h"
-#include "common/global.h"
 #include "input/input.h"
 #include "input/cmd.h"
 #include "misc/ctype.h"
@@ -172,7 +170,7 @@ static void prop_unref(struct observe_property *prop)
     if (!prop)
         return;
 
-    assert(prop->refcount > 0);
+    mp_assert(prop->refcount > 0);
     prop->refcount -= 1;
     if (!prop->refcount)
         talloc_free(prop);
@@ -192,7 +190,7 @@ void mp_clients_destroy(struct MPContext *mpctx)
 {
     if (!mpctx->clients)
         return;
-    assert(mpctx->clients->num_clients == 0);
+    mp_assert(mpctx->clients->num_clients == 0);
 
     // The API user is supposed to call mpv_render_context_free(). It's simply
     // not allowed not to do this.
@@ -259,7 +257,8 @@ bool mp_client_id_exists(struct MPContext *mpctx, int64_t id)
     return r;
 }
 
-struct mpv_handle *mp_new_client(struct mp_client_api *clients, const char *name)
+static struct mpv_handle *new_client(struct mp_client_api *clients,
+                                     const char *name, bool weak)
 {
     mp_mutex_lock(&clients->lock);
 
@@ -295,6 +294,7 @@ struct mpv_handle *mp_new_client(struct mp_client_api *clients, const char *name
         .max_events = num_events,
         .event_mask = (1ULL << INTERNAL_EVENT_BASE) - 1, // exclude internal events
         .wakeup_pipe = {-1, -1},
+        .is_weak = weak,
     };
     mp_mutex_init(&client->lock);
     mp_mutex_init(&client->wakeup_lock);
@@ -315,11 +315,14 @@ struct mpv_handle *mp_new_client(struct mp_client_api *clients, const char *name
     return client;
 }
 
-void mp_client_set_weak(struct mpv_handle *ctx)
+struct mpv_handle *mp_new_client(struct mp_client_api *clients, const char *name)
 {
-    mp_mutex_lock(&ctx->lock);
-    ctx->is_weak = true;
-    mp_mutex_unlock(&ctx->lock);
+    return new_client(clients, name, false);
+}
+
+struct mpv_handle *mp_new_weak_client(struct mp_client_api *clients, const char *name)
+{
+    return new_client(clients, name, true);
 }
 
 const char *mpv_client_name(mpv_handle *ctx)
@@ -423,11 +426,6 @@ static void abort_async(struct MPContext *mpctx, mpv_handle *ctx,
     mp_mutex_unlock(&mpctx->abort_lock);
 }
 
-static void get_thread_id(void *ptr)
-{
-    *(mp_thread_id *)ptr = mp_thread_current_id();
-}
-
 static void mp_destroy_client(mpv_handle *ctx, bool terminate)
 {
     if (!ctx)
@@ -436,7 +434,7 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
     struct MPContext *mpctx = ctx->mpctx;
     struct mp_client_api *clients = ctx->clients;
 
-    MP_DBG(ctx, "Exiting...\n");
+    MP_DBG(ctx, "Destroying client handle...\n");
 
     if (terminate)
         mpv_command(ctx, (const char*[]){"quit", NULL});
@@ -489,7 +487,7 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
             break;
         }
     }
-    assert(!ctx);
+    mp_assert(!ctx);
 
     if (mpctx->is_cli) {
         terminate = false;
@@ -522,9 +520,6 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
         mpctx->stop_play = PT_QUIT;
         mp_dispatch_unlock(mpctx->dispatch);
 
-        mp_thread_id playthread;
-        mp_dispatch_run(mpctx->dispatch, get_thread_id, &playthread);
-
         // Ask the core thread to stop.
         mp_mutex_lock(&clients->lock);
         clients->terminate_core_thread = true;
@@ -532,7 +527,7 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
         mp_wakeup_core(mpctx);
 
         // Blocking wait for all clients and core thread to terminate.
-        mp_thread_join_id(playthread);
+        mp_thread_join(mpctx->core_thread);
 
         mp_destroy(mpctx);
     }
@@ -616,7 +611,7 @@ static MP_THREAD_VOID core_thread(void *p)
     MP_THREAD_RETURN();
 }
 
-mpv_handle *mpv_create(void)
+static mpv_handle *create_core(bool weak)
 {
     struct MPContext *mpctx = mp_create();
     if (!mpctx)
@@ -624,14 +619,13 @@ mpv_handle *mpv_create(void)
 
     m_config_set_profile(mpctx->mconfig, "libmpv", 0);
 
-    mpv_handle *ctx = mp_new_client(mpctx->clients, "main");
+    mpv_handle *ctx = new_client(mpctx->clients, "main", weak);
     if (!ctx) {
         mp_destroy(mpctx);
         return NULL;
     }
 
-    mp_thread thread;
-    if (mp_thread_create(&thread, core_thread, mpctx) != 0) {
+    if (mp_thread_create(&mpctx->core_thread, core_thread, mpctx) != 0) {
         ctx->clients->have_terminator = true; // avoid blocking
         mpv_terminate_destroy(ctx);
         mp_destroy(mpctx);
@@ -641,31 +635,54 @@ mpv_handle *mpv_create(void)
     return ctx;
 }
 
-mpv_handle *mpv_create_client(mpv_handle *ctx, const char *name)
+mpv_handle *mpv_create(void)
+{
+    return create_core(false);
+}
+
+static mpv_handle *create_client(mpv_handle *ctx, const char *name, bool weak)
 {
     if (!ctx)
-        return mpv_create();
-    mpv_handle *new = mp_new_client(ctx->mpctx->clients, name);
+        return create_core(weak);
+    mpv_handle *new = new_client(ctx->mpctx->clients, name, weak);
     if (new)
         mpv_wait_event(new, 0); // set fuzzy_initialized
     return new;
 }
 
+mpv_handle *mpv_create_client(mpv_handle *ctx, const char *name)
+{
+    return create_client(ctx, name, false);
+}
+
 mpv_handle *mpv_create_weak_client(mpv_handle *ctx, const char *name)
 {
-    mpv_handle *new = mpv_create_client(ctx, name);
-    if (new)
-        mp_client_set_weak(new);
-    return new;
+    return create_client(ctx, name, true);
+}
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+int mpv_initialize_opts(mpv_handle *ctx, char **options);
+#else
+static
+#endif
+int mpv_initialize_opts(mpv_handle *ctx, char **options)
+{
+    lock_core(ctx);
+    int res = mp_initialize(ctx->mpctx, options) ? MPV_ERROR_INVALID_PARAMETER : 0;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    // Only the options parser fuzzer passes options. It wants them parsed and
+    // applied, not played.
+    if (options)
+        ctx->mpctx->stop_play = PT_QUIT;
+#endif
+    mp_wakeup_core(ctx->mpctx);
+    unlock_core(ctx);
+    return res;
 }
 
 int mpv_initialize(mpv_handle *ctx)
 {
-    lock_core(ctx);
-    int res = mp_initialize(ctx->mpctx, NULL) ? MPV_ERROR_INVALID_PARAMETER : 0;
-    mp_wakeup_core(ctx->mpctx);
-    unlock_core(ctx);
-    return res;
+    return mpv_initialize_opts(ctx, NULL);
 }
 
 // set ev->data to a new copy of the original data
@@ -758,7 +775,7 @@ static void send_reply(struct mpv_handle *ctx, uint64_t userdata,
     event->reply_userdata = userdata;
     mp_mutex_lock(&ctx->lock);
     // If this fails, reserve_reply() probably wasn't called.
-    assert(ctx->reserved_events > 0);
+    mp_assert(ctx->reserved_events > 0);
     ctx->reserved_events--;
     if (append_event(ctx, *event, false) < 0)
         MP_ASSERT_UNREACHABLE();
@@ -819,10 +836,12 @@ int mp_client_send_event(struct MPContext *mpctx, const char *client_name,
         r = send_event(ctx, &event_data, false);
     } else {
         r = -1;
-        talloc_free(data);
     }
 
     mp_mutex_unlock(&clients->lock);
+
+    if (r < 0)
+        talloc_free(data);
 
     return r;
 }
@@ -855,7 +874,7 @@ int mpv_request_event(mpv_handle *ctx, mpv_event_id event, int enable)
         return MPV_ERROR_INVALID_PARAMETER;
     if (event == MPV_EVENT_SHUTDOWN && !enable)
         return MPV_ERROR_INVALID_PARAMETER;
-    assert(event < (int)INTERNAL_EVENT_BASE); // excluded above; they have no name
+    mp_assert(event < (int)INTERNAL_EVENT_BASE); // excluded above; they have no name
     mp_mutex_lock(&ctx->lock);
     uint64_t bit = 1ULL << event;
     ctx->event_mask = enable ? ctx->event_mask | bit : ctx->event_mask & ~bit;
@@ -1150,7 +1169,7 @@ int mpv_command(mpv_handle *ctx, const char **args)
 int mpv_command_node(mpv_handle *ctx, mpv_node *args, mpv_node *result)
 {
     struct mpv_node rn = {.format = MPV_FORMAT_NONE};
-    int r = run_client_command(ctx, mp_input_parse_cmd_node(ctx->log, args), &rn);
+    int r = run_client_command(ctx, mp_input_parse_cmd_node(ctx->log, args), result ? &rn : NULL);
     if (result && r >= 0)
         *result = rn;
     return r;
@@ -1159,7 +1178,7 @@ int mpv_command_node(mpv_handle *ctx, mpv_node *args, mpv_node *result)
 int mpv_command_ret(mpv_handle *ctx, const char **args, mpv_node *result)
 {
     struct mpv_node rn = {.format = MPV_FORMAT_NONE};
-    int r = run_client_command(ctx, mp_input_parse_cmd_strv(ctx->log, args), &rn);
+    int r = run_client_command(ctx, mp_input_parse_cmd_strv(ctx->log, args), result ? &rn : NULL);
     if (result && r >= 0)
         *result = rn;
     return r;
@@ -1526,7 +1545,7 @@ static void property_free(void *p)
 {
     struct observe_property *prop = p;
 
-    assert(prop->refcount == 0);
+    mp_assert(prop->refcount == 0);
 
     if (prop->type) {
         m_option_free(prop->type, &prop->value);
@@ -1545,7 +1564,7 @@ int mpv_observe_property(mpv_handle *ctx, uint64_t userdata,
         return MPV_ERROR_PROPERTY_FORMAT;
 
     mp_mutex_lock(&ctx->lock);
-    assert(!ctx->destroying);
+    mp_assert(!ctx->destroying);
     struct observe_property *prop = talloc_ptrtype(ctx, prop);
     talloc_set_destructor(prop, property_free);
     *prop = (struct observe_property){
@@ -1710,7 +1729,7 @@ static void send_client_property_changes(struct mpv_handle *ctx)
                 ctx->has_pending_properties = true;
                 break;
             }
-            assert(prop->refcount > 0);
+            mp_assert(prop->refcount > 0);
 
             bool val_valid = req.status >= 0;
             changed = prop->value_valid != val_valid;
@@ -2064,7 +2083,7 @@ static const char *const err_table[] = {
     [-MPV_ERROR_SUCCESS] = "success",
     [-MPV_ERROR_EVENT_QUEUE_FULL] = "event queue full",
     [-MPV_ERROR_NOMEM] = "memory allocation failed",
-    [-MPV_ERROR_UNINITIALIZED] = "core not uninitialized",
+    [-MPV_ERROR_UNINITIALIZED] = "core not initialized",
     [-MPV_ERROR_INVALID_PARAMETER] = "invalid parameter",
     [-MPV_ERROR_OPTION_NOT_FOUND] = "option not found",
     [-MPV_ERROR_OPTION_FORMAT] = "unsupported format for accessing option",
@@ -2164,7 +2183,7 @@ void kill_video_async(struct mp_client_api *client_api)
 bool mp_set_main_render_context(struct mp_client_api *client_api,
                                 struct mpv_render_context *ctx, bool active)
 {
-    assert(ctx);
+    mp_assert(ctx);
 
     mp_mutex_lock(&client_api->lock);
     bool is_set = !!client_api->render_context;

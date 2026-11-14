@@ -17,11 +17,7 @@
 
 #include "config.h"
 
-#if HAVE_LAVU_UUID
 #include <libavutil/uuid.h>
-#else
-#include "misc/uuid.h"
-#endif
 
 #include "options/m_config.h"
 #include "video/out/placebo/ra_pl.h"
@@ -39,7 +35,7 @@ struct vulkan_opts {
 
 static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
 {
-    int ret = M_OPT_INVALID;
+    int ret = M_OPT_EXIT;
     void *ta_ctx = talloc_new(NULL);
     pl_log pllog = mppl_log_create(ta_ctx, log);
     if (!pllog)
@@ -49,13 +45,17 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
     mppl_log_set_probing(pllog, true);
     pl_vk_inst inst = pl_vk_inst_create(pllog, pl_vk_inst_params());
     mppl_log_set_probing(pllog, false);
-    if (!inst)
+    if (!inst) {
+        mp_info(log, "Failed to create Vulkan instance\n");
         goto done;
+    }
 
     uint32_t num = 0;
     VkResult res = vkEnumeratePhysicalDevices(inst->instance, &num, NULL);
-    if (res != VK_SUCCESS)
+    if (res != VK_SUCCESS) {
+        mp_info(log, "Failed to enumerate Vulkan devices\n");
         goto done;
+    }
 
     VkPhysicalDevice *devices = talloc_array(ta_ctx, VkPhysicalDevice, num);
     res = vkEnumeratePhysicalDevices(inst->instance, &num, devices);
@@ -63,18 +63,25 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
         goto done;
 
     struct bstr param = bstr0(*value);
-    bool help = bstr_equals0(param, "help");
-    if (help) {
-        mp_info(log, "Available vulkan devices:\n");
-        ret = M_OPT_EXIT;
+    if (!param.len) {
+        mp_err(log, "No Vulkan device specified.\n");
+        ret = M_OPT_INVALID;
+        goto done;
     }
+    bool help = bstr_equals0(param, "help");
+    if (help)
+        mp_info(log, "Available vulkan devices:\n");
 
     AVUUID param_uuid;
     bool is_uuid = av_uuid_parse(*value, param_uuid) == 0;
 
     for (int i = 0; i < num; i++) {
+        VkPhysicalDeviceDriverProperties driver_prop = { 0 };
+        driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
         VkPhysicalDeviceIDPropertiesKHR id_prop = { 0 };
         id_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES_KHR;
+        id_prop.pNext = &driver_prop;
 
         VkPhysicalDeviceProperties2KHR prop2 = { 0 };
         prop2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
@@ -87,9 +94,10 @@ static inline OPT_STRING_VALIDATE_FUNC(vk_validate_dev)
         if (help) {
             char device_uuid[37];
             av_uuid_unparse(id_prop.deviceUUID, device_uuid);
-            mp_info(log, "  '%s' (GPU %d, PCI ID %x:%x, UUID %s)\n",
+            mp_info(log, "  '%s' (GPU %d, PCI ID %x:%x, UUID %s, Driver %s)\n",
                     prop->deviceName, i, (unsigned)prop->vendorID,
-                    (unsigned)prop->deviceID, device_uuid);
+                    (unsigned)prop->deviceID, device_uuid,
+                    driver_prop.driverName);
         } else if (bstr_equals0(param, prop->deviceName)) {
             ret = 0;
             goto done;
@@ -123,7 +131,6 @@ const struct m_sub_options vulkan_conf = {
         {"vulkan-queue-count", OPT_INT(queue_count), M_RANGE(1, 8)},
         {"vulkan-async-transfer", OPT_BOOL(async_transfer)},
         {"vulkan-async-compute", OPT_BOOL(async_compute)},
-        {"vulkan-disable-events", OPT_REMOVED("Unused")},
         {0}
     },
     .size = sizeof(struct vulkan_opts),
@@ -133,12 +140,13 @@ const struct m_sub_options vulkan_conf = {
         .async_transfer = true,
         .async_compute = true,
     },
+    .change_flags = UPDATE_VO,
 };
 
 struct priv {
     struct mpvk_ctx *vk;
     struct vulkan_opts *opts;
-    struct ra_vk_ctx_params params;
+    struct ra_ctx_params params;
     struct ra_tex proxy_tex;
 };
 
@@ -176,62 +184,312 @@ void ra_vk_ctx_uninit(struct ra_ctx *ctx)
 pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
                              pl_vk_inst vkinst,
                              pl_log pllog,
-                             VkSurfaceKHR surface)
+                             VkSurfaceKHR surface,
+                             bool allow_software)
 {
     VkPhysicalDeviceFeatures2 features = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
     };
 
-#if HAVE_VULKAN_INTEROP
     /*
      * Request the additional extensions and features required to make full use
      * of the ffmpeg Vulkan hwcontext and video decoding capability.
      */
     const char *opt_extensions[] = {
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
         VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+#endif
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
-        VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
+        VK_EXT_SHADER_REPLICATED_COMPOSITES_EXTENSION_NAME,
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+        VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+        VK_KHR_SHADER_EXPECT_ASSUME_EXTENSION_NAME,
+        VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME,
+        VK_KHR_SHADER_RELAXED_EXTENDED_INSTRUCTION_EXTENSION_NAME,
+        VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME,
+        VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME,
         VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME,
+        VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME,
+        VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME,
+        VK_KHR_VIDEO_MAINTENANCE_2_EXTENSION_NAME,
         VK_KHR_VIDEO_QUEUE_EXTENSION_NAME,
-        "VK_KHR_video_decode_av1", /* VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME */
+        VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+        VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME,
+        VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
+        /*
+         * Extensions below this point are newer than our minimum required Vulkan
+         * headers and so we only activate them if the build time headers contain
+         * them.
+         */
+#ifdef VK_EXT_zero_initialize_device_memory
+        VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME, /* 1.4.315 */
+#endif
+#ifdef VK_KHR_video_decode_vp9
+        VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME, /* 1.4.317 */
+#endif
+#ifdef VK_KHR_maintenance9
+        VK_KHR_MAINTENANCE_9_EXTENSION_NAME, /* 1.4.317 */
+#endif
+#ifdef VK_KHR_unified_image_layouts
+        VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME, /* 1.4.317 */
+#endif
+#ifdef VK_EXT_shader_long_vector
+        VK_EXT_SHADER_LONG_VECTOR_EXTENSION_NAME, /* 1.4.337 */
+#endif
+#ifdef VK_KHR_maintenance11
+        VK_KHR_MAINTENANCE_11_EXTENSION_NAME, /* 1.4.350 */
+#endif
+#if defined(VK_KHR_internally_synchronized_queues) && PL_API_VER >= 365 && \
+    LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 32, 100)
+        VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,
+#endif
     };
 
+    /*
+     * The following chain of conditional extension features must be constructed
+     * in descending vulkan version order. This ensures that if one is present,
+     * the next extension that chains on to it will also be present.
+     */
+
+#ifdef VK_KHR_maintenance11
+    VkPhysicalDeviceMaintenance11FeaturesKHR maintenance_11_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_11_FEATURES_KHR,
+        .maintenance11 = true,
+    };
+#endif
+
+#ifdef VK_EXT_shader_long_vector
+    VkPhysicalDeviceShaderLongVectorFeaturesEXT long_vector_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_LONG_VECTOR_FEATURES_EXT,
+#ifdef VK_KHR_maintenance11
+        .pNext = &maintenance_11_feature,
+#endif
+        .longVector = true,
+    };
+#endif
+
+#ifdef VK_KHR_unified_image_layouts
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified_image_layouts_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+#ifdef VK_EXT_shader_long_vector
+        .pNext = &long_vector_feature,
+#endif
+        .unifiedImageLayouts = true,
+        .unifiedImageLayoutsVideo = true,
+    };
+#endif
+
+#ifdef VK_KHR_maintenance9
+    VkPhysicalDeviceMaintenance9FeaturesKHR maintenance_9_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_9_FEATURES_KHR,
+#ifdef VK_KHR_unified_image_layouts
+        .pNext = &unified_image_layouts_feature,
+#endif
+        .maintenance9 = true,
+    };
+#endif
+
+#ifdef VK_KHR_video_decode_vp9
+     VkPhysicalDeviceVideoDecodeVP9FeaturesKHR video_decode_vp9_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR,
+#ifdef VK_KHR_maintenance9
+        .pNext = &maintenance_9_feature,
+#endif
+        .videoDecodeVP9 = true,
+    };
+#endif
+
+#ifdef VK_EXT_zero_initialize_device_memory
+    VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT zero_init_device_memory_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_DEVICE_MEMORY_FEATURES_EXT,
+#ifdef VK_KHR_video_decode_vp9
+        .pNext = &video_decode_vp9_feature,
+#endif
+        .zeroInitializeDeviceMemory = true,
+    };
+#endif
+
+    /*
+     * Newer libplacebo enables the video maintenance features itself, but
+     * our minimum accepted version 7.360.1 does not.
+     */
+    VkPhysicalDeviceVideoMaintenance2FeaturesKHR video_maintenance_2_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_2_FEATURES_KHR,
+#ifdef VK_EXT_zero_initialize_device_memory
+        .pNext = &zero_init_device_memory_feature,
+#endif
+        .videoMaintenance2 = true,
+    };
+
+    VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR shader_relaxed_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR,
+        .pNext = &video_maintenance_2_feature,
+        .shaderRelaxedExtendedInstruction = true,
+    };
+
+    VkPhysicalDeviceShaderReplicatedCompositesFeaturesEXT replicated_composites_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_REPLICATED_COMPOSITES_FEATURES_EXT,
+        .pNext = &shader_relaxed_feature,
+        .shaderReplicatedComposites = true,
+    };
+
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR,
+        .pNext = &replicated_composites_feature,
+        .shaderMaximalReconvergence = true,
+    };
+
+    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR shader_subgroup_rotate_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR,
+        .pNext = &maximal_reconvergence_feature,
+       .shaderSubgroupRotate = true,
+    };
+
+    VkPhysicalDeviceShaderExpectAssumeFeaturesKHR shader_expect_assume_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_EXPECT_ASSUME_FEATURES_KHR,
+        .pNext = &shader_subgroup_rotate_feature,
+       .shaderExpectAssume = true,
+    };
+
+    /*
+     * Newer libplacebo enables the video maintenance features itself, but
+     * our minimum accepted version 7.360.1 does not.
+     */
+    VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance_1_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR,
+        .pNext = &shader_expect_assume_feature,
+        .videoMaintenance1 = true,
+    };
+
+     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
+        .pNext = &video_maintenance_1_feature,
+        .cooperativeMatrix = true,
+    };
+
+    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR explicit_mem_layout_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR,
+        .pNext = &cooperative_matrix_feature,
+        .workgroupMemoryExplicitLayout = true,
+        .workgroupMemoryExplicitLayoutScalarBlockLayout = true,
+        .workgroupMemoryExplicitLayout8BitAccess = true,
+        .workgroupMemoryExplicitLayout16BitAccess = true,
+    };
+
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV,
+        .pNext = &explicit_mem_layout_feature,
+        .opticalFlow = true,
+    };
+
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer_feature = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
-        .pNext = NULL,
+        .pNext = &optical_flow_feature,
         .descriptorBuffer = true,
         .descriptorBufferPushDescriptors = true,
     };
+#endif
 
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_feature = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+#if LIBAVUTIL_VERSION_INT < AV_VERSION_INT(60, 26, 0)
         .pNext = &descriptor_buffer_feature,
+#else
+        .pNext = &optical_flow_feature,
+#endif
         .shaderBufferFloat32Atomics = true,
         .shaderBufferFloat32AtomicAdd = true,
     };
 
-    features.pNext = &atomic_float_feature;
+    /*
+     * Features that libplacebo does not request on its own. The core 1.1-1.3
+     * features it already enables (directly or through its required/recommended
+     * feature chains) are not repeated here.
+     */
+    VkPhysicalDeviceVulkan13Features recommended_vk13 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .pNext = &atomic_float_feature,
+        .dynamicRendering = true,
+        .subgroupSizeControl = true,
+    };
+
+    VkPhysicalDeviceVulkan12Features recommended_vk12 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &recommended_vk13,
+        .scalarBlockLayout = true,
+        .vulkanMemoryModelAvailabilityVisibilityChains = true,
+        .shaderSubgroupExtendedTypes = true,
+        .shaderUniformBufferArrayNonUniformIndexing = true,
+        .shaderSampledImageArrayNonUniformIndexing = true,
+        .shaderStorageBufferArrayNonUniformIndexing = true,
+        .shaderStorageImageArrayNonUniformIndexing = true,
+        .runtimeDescriptorArray = true,
+        .shaderBufferInt64Atomics = true,
+        .uniformBufferStandardLayout = true,
+    };
+
+    VkPhysicalDeviceVulkan11Features recommended_vk11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &recommended_vk12,
+        .storageBuffer16BitAccess = true,
+        .uniformAndStorageBuffer16BitAccess = true,
+    };
+
+    VkPhysicalDeviceFeatures2 recommended_features = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &recommended_vk11,
+        .features = {
+            .shaderInt16 = true,
+            .shaderFloat64 = true,
+        },
+    };
+
+    features.pNext = &recommended_features;
+
+#if defined(VK_KHR_internally_synchronized_queues) && PL_API_VER >= 365 && \
+    LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 32, 100)
+    /*
+     * libplacebo creates every queue with
+     * VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR when this is
+     * requested, and hwdec_vulkan passes the flag on through
+     * AVVulkanDeviceContext.queue_flags. Older lavu retrieves queues with
+     * flags 0 and gets VK_NULL_HANDLE, so only request it from lavu that
+     * knows the flags, and from libplacebo that will use it too.
+     */
+    VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR synchronized_queues_feature = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR,
+        .pNext = features.pNext,
+        .internallySynchronizedQueues = true,
+    };
+    features.pNext = &synchronized_queues_feature;
 #endif
 
     AVUUID param_uuid = { 0 };
     bool is_uuid = opts->device &&
                    av_uuid_parse(opts->device, param_uuid) == 0;
 
-    assert(pllog);
-    assert(vkinst);
+    /*
+     * Request extra queue families opportunistically. These will only be
+     * enabled if present.
+     */
+    VkQueueFlags extra_queues = VK_QUEUE_VIDEO_DECODE_BIT_KHR |
+                                VK_QUEUE_OPTICAL_FLOW_BIT_NV;
+
+    mp_assert(pllog);
+    mp_assert(vkinst);
     struct pl_vulkan_params device_params = {
         .instance = vkinst->instance,
         .get_proc_addr = vkinst->get_proc_addr,
         .surface = surface,
+        .allow_software = allow_software,
         .async_transfer = opts->async_transfer,
         .async_compute = opts->async_compute,
         .queue_count = opts->queue_count,
-#if HAVE_VULKAN_INTEROP
-        .extra_queues = VK_QUEUE_VIDEO_DECODE_BIT_KHR,
+        .extra_queues = extra_queues,
         .opt_extensions = opt_extensions,
         .num_opt_extensions = MP_ARRAY_SIZE(opt_extensions),
-#endif
         .features = &features,
         .device_name = is_uuid ? NULL : opts->device,
     };
@@ -243,7 +501,7 @@ pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
 }
 
 bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
-                    struct ra_vk_ctx_params params,
+                    struct ra_ctx_params params,
                     VkPresentModeKHR preferred_mode)
 {
     struct ra_swapchain *sw = ctx->swapchain = talloc_zero(NULL, struct ra_swapchain);
@@ -255,7 +513,8 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
     p->params = params;
     p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
 
-    vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, vk->surface);
+    vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog, vk->surface,
+                                    ctx->opts.allow_sw);
     if (!vk->vulkan)
         goto error;
 
@@ -269,9 +528,7 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
         .surface = vk->surface,
         .present_mode = preferred_mode,
         .swapchain_depth = ctx->vo->opts->swapchain_depth,
-        // mpv already handles resize events, so gracefully allow suboptimal
-        // swapchains to exist in order to make resizing even smoother
-        .allow_suboptimal = true,
+        .alpha_bits = ctx->opts.want_alpha ? 8 : 0,
     };
 
     if (p->opts->swap_mode >= 0) // user override
@@ -311,6 +568,15 @@ char *ra_vk_ctx_get_device_name(struct ra_ctx *ctx)
     char *device_name = talloc_strdup(NULL, opts->device);
     talloc_free(opts);
     return device_name;
+}
+
+static int color_depth(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.color_depth)
+        return p->params.color_depth(sw->ctx);
+
+    return -1;
 }
 
 static bool start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
@@ -361,7 +627,54 @@ static void get_vsync(struct ra_swapchain *sw,
         p->params.get_vsync(sw->ctx, info);
 }
 
+static bool set_color(struct ra_swapchain *sw, struct mp_image_params *params)
+{
+    struct priv *p = sw->priv;
+
+    // Vulkan Wayland needs special handling to avoid duplicated color surface.
+    bool waylandvk = strcmp(sw->ctx->fns->name, "waylandvk") == 0;
+    if (p->params.set_color) {
+        if (waylandvk && params) {
+          // Request VK_COLOR_SPACE_PASS_THROUGH_EXT, and also force immediate
+          // cleanup of swapchain retired by pl_swapchain_colorspace_hint,
+          // otherwise there's a possibility the Wayland color surface will be
+          // held while we try to create a new one.
+          pl_swapchain_colorspace_hint(p->vk->swapchain,
+                                       &(struct pl_color_space){0});
+        }
+        bool ret = p->params.set_color(sw->ctx, params);
+        // To avoid ping-pong between VK_COLOR_SPACE_PASS_THROUGH_EXT and others,
+        // we assume that internal Wayland set_color always work, and update
+        // params to fallback values if needed.
+        mp_assert(ret || !waylandvk);
+        return ret;
+    }
+    // Technically we could call pl_swapchain_colorspace_hint() here directly,
+    // but we want to know when parameters are set "externally".
+    return false;
+}
+
+static pl_color_space_t target_csp(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.preferred_csp)
+        return p->params.preferred_csp(sw->ctx);
+    return (pl_color_space_t){0};
+}
+
+static float target_ref_luma(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.preferred_ref_luma)
+        return p->params.preferred_ref_luma(sw->ctx);
+    return 0;
+}
+
 static const struct ra_swapchain_fns vulkan_swapchain = {
+    .color_depth   = color_depth,
+    .set_color     = set_color,
+    .target_csp    = target_csp,
+    .target_ref_luma = target_ref_luma,
     .start_frame   = start_frame,
     .submit_frame  = submit_frame,
     .swap_buffers  = swap_buffers,

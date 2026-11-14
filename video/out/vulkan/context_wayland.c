@@ -25,18 +25,39 @@
 
 struct priv {
     struct mpvk_ctx vk;
+    bool use_fifo;
 };
+
+static int wayland_vk_color_depth(struct ra_ctx *ctx)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    // If compositor supports color management, assume it is capable of
+    // dithering on its own. Otherwise fallback to 8-bit color depth.
+    return wl->color_manager ? 0 : 8;
+}
 
 static bool wayland_vk_check_visible(struct ra_ctx *ctx)
 {
     return vo_wayland_check_visible(ctx->vo);
 }
 
+static bool wayland_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+{
+    vo_wayland_handle_color(ctx->vo->wl, params);
+    return true;
+}
+
+static pl_color_space_t wayland_vk_preferred_csp(struct ra_ctx *ctx)
+{
+    return vo_wayland_preferred_csp(ctx->vo);
+}
+
 static void wayland_vk_swap_buffers(struct ra_ctx *ctx)
 {
     struct vo_wayland_state *wl = ctx->vo->wl;
+    struct priv *p = ctx->priv;
 
-    if (!wl->opts->disable_vsync)
+    if ((!p->use_fifo && wl->opts->wl_internal_vsync == 1) || wl->opts->wl_internal_vsync == 2)
         vo_wayland_wait_frame(wl);
 
     if (wl->use_present)
@@ -77,8 +98,11 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
          .surface = ctx->vo->wl->surface,
     };
 
-    struct ra_vk_ctx_params params = {
+    struct ra_ctx_params params = {
+        .color_depth = wayland_vk_color_depth,
         .check_visible = wayland_vk_check_visible,
+        .preferred_csp = wayland_vk_preferred_csp,
+        .set_color    = wayland_vk_set_color,
         .swap_buffers = wayland_vk_swap_buffers,
         .get_vsync = wayland_vk_get_vsync,
     };
@@ -90,13 +114,15 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
         goto error;
     }
 
-    /* Because in Wayland clients render whenever they receive a callback from
-     * the compositor, and the fact that the compositor usually stops sending
-     * callbacks once the surface is no longer visible, using FIFO here would
-     * mean the entire player would block on acquiring swapchain images. Hence,
-     * use MAILBOX to guarantee that there'll always be a swapchain image and
-     * the player won't block waiting on those */
-    if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_MAILBOX_KHR))
+    /* If the Wayland compositor does not support fifo and presentation time
+     * v2 protocols, the compositor will stop sending callbacks if the surface
+     * is no longer visible. This means using FIFO would block the entire vo
+     * thread which is just not good. Use MAILBOX for those compositors to
+     * avoid indefinite blocking. */
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    p->use_fifo = wl->has_fifo && wl->opts->wl_internal_vsync != 2 && wl->presentation &&
+                  wl_proxy_get_version((struct wl_proxy *)wl->presentation) >= 2;
+    if (!ra_vk_ctx_init(ctx, vk, params, p->use_fifo ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR))
         goto error;
 
     ra_add_native_resource(ctx->ra, "wl", ctx->vo->wl->display);

@@ -10,10 +10,16 @@ syntax is:
 If the list has a trailing ',', mpv will fall back on drivers not contained
 in the list.
 
+This is an object settings list option. See `List Options`_ for details.
+
 .. note::
 
     See ``--ao=help`` for a list of compiled-in audio output drivers sorted by
     autoprobe order.
+
+    Note that the default audio output driver is subject to change, and must
+    not be relied upon. If a certain AO needs to be used, it must be
+    explicitly specified.
 
 Available audio output drivers are:
 
@@ -152,6 +158,9 @@ Available audio output drivers are:
         Turning on spatial audio may hang the playback
         if mpv is not started out of the bundle,
         though playback with spatial audio off always works.
+
+``audiounit`` (iOS only)
+    Native iOS audio output driver using ``AudioUnits`` and AudioToolbox.
 
 ``openal``
     OpenAL audio output driver.

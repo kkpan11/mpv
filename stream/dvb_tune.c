@@ -7,20 +7,20 @@
    http://svn.mplayerhq.hu/mplayer/trunk/
    $Id$
 
-   This program is free software; you can redistribute it and/or
-   modify it under the terms of the GNU General Public License
-   as published by the Free Software Foundation; either version 2
-   of the License, or (at your option) any later version.
+   This file is part of mpv.
 
-   This program is distributed in the hope that it will be useful,
+   mpv is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2 of the License, or
+   (at your option) any later version.
+
+   mpv is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
 
-   You should have received a copy of the GNU General Public License
-   along with this program; if not, write to the Free Software
-   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
-   Or, point your browser to http://www.gnu.org/copyleft/gpl.html
+   You should have received a copy of the GNU General Public License along
+   with mpv.  If not, see <http://www.gnu.org/licenses/>.
 
 */
 
@@ -28,13 +28,14 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <poll.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <linux/dvb/dmx.h>
 #include <linux/dvb/frontend.h>
 
+#include "common/common.h"
 #include "osdep/io.h"
+#include "osdep/poll_wrapper.h"
 #include "osdep/timer.h"
 #include "dvbin.h"
 #include "dvb_tune.h"
@@ -207,7 +208,7 @@ int dvb_get_pmt_pid(dvb_priv_t *priv, int devno, int service_id)
     fparams.flags = DMX_IMMEDIATE_START | DMX_CHECK_CRC;
 
     int pat_fd;
-    if ((pat_fd = open(demux_dev, O_RDWR)) < 0) {
+    if ((pat_fd = open(demux_dev, O_RDWR | O_CLOEXEC)) < 0) {
         MP_ERR(priv, "Opening PAT demux failed: %d", errno);
         return -1;
     }
@@ -277,7 +278,7 @@ static void print_status(dvb_priv_t *priv, fe_status_t festatus)
     MP_VERBOSE(priv, "\n");
 }
 
-static int check_status(dvb_priv_t *priv, int fd_frontend, int tmout)
+static int check_status(dvb_priv_t *priv, int fd_frontend, float tmout)
 {
     fe_status_t festatus;
     bool ok = false;
@@ -291,7 +292,7 @@ static int check_status(dvb_priv_t *priv, int fd_frontend, int tmout)
     int tm1 = (int)mp_time_sec();
     while (!ok) {
         festatus = 0;
-        if (poll(pfd, 1, tmout * 1000) > 0) {
+        if (mp_poll(pfd, 1, MP_TIME_S_TO_NS(tmout)) > 0) {
             if (pfd[0].revents & POLLPRI) {
                 if (ioctl(fd_frontend, FE_READ_STATUS, &festatus) >= 0) {
                     if (festatus & FE_HAS_LOCK)
@@ -299,7 +300,7 @@ static int check_status(dvb_priv_t *priv, int fd_frontend, int tmout)
                 }
             }
         }
-        usleep(10000);
+        mp_sleep_ns(MP_TIME_MS_TO_NS(10));
         int tm2 = (int)mp_time_sec();
         if ((festatus & FE_TIMEDOUT) || (locks >= 2) || (tm2 - tm1 >= tmout))
             ok = true;
@@ -307,7 +308,7 @@ static int check_status(dvb_priv_t *priv, int fd_frontend, int tmout)
 
     if (!(festatus & FE_HAS_LOCK)) {
         MP_ERR(priv, "Not able to lock to the signal on the given frequency, "
-               "timeout: %d\n", tmout);
+               "timeout: %g\n", tmout);
         return -1;
     }
 
@@ -344,17 +345,17 @@ static int diseqc_send_msg(int fd, fe_sec_voltage_t v, struct diseqc_cmd *cmd,
         return -1;
     if (ioctl(fd, FE_SET_VOLTAGE, v) < 0)
         return -1;
-    usleep(15 * 1000);
+    mp_sleep_ns(MP_TIME_MS_TO_NS(15));
     if (ioctl(fd, FE_DISEQC_SEND_MASTER_CMD, &cmd->cmd) < 0)
         return -1;
-    usleep(cmd->wait * 1000);
-    usleep(15 * 1000);
+    mp_sleep_ns(MP_TIME_MS_TO_NS(cmd->wait));
+    mp_sleep_ns(MP_TIME_MS_TO_NS(15));
     if (ioctl(fd, FE_DISEQC_SEND_BURST, b) < 0)
         return -1;
-    usleep(15 * 1000);
+    mp_sleep_ns(MP_TIME_MS_TO_NS(15));
     if (ioctl(fd, FE_SET_TONE, t) < 0)
         return -1;
-    usleep(100000);
+    mp_sleep_ns(MP_TIME_MS_TO_NS(100));
 
     return 0;
 }
@@ -402,7 +403,7 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
                    fe_guard_interval_t guardInterval,
                    fe_bandwidth_t bandwidth,
                    fe_code_rate_t LP_CodeRate, fe_hierarchy_t hier,
-                   int timeout)
+                   float timeout)
 {
     dvb_state_t *state = priv->state;
 
@@ -537,7 +538,7 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
                 { .cmd = DTV_TUNE },
             };
             struct dtv_properties cmdseq = {
-                .num = sizeof(p) / sizeof(p[0]),
+                .num = MP_ARRAY_SIZE(p),
                 .props = p
             };
             if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
@@ -565,7 +566,7 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
                 { .cmd = DTV_TUNE },
             };
             struct dtv_properties cmdseq = {
-                .num = sizeof(p) / sizeof(p[0]),
+                .num = MP_ARRAY_SIZE(p),
                 .props = p
             };
             if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
@@ -586,7 +587,7 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
                 { .cmd = DTV_TUNE },
             };
             struct dtv_properties cmdseq = {
-                .num = sizeof(p) / sizeof(p[0]),
+                .num = MP_ARRAY_SIZE(p),
                 .props = p
             };
             if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
@@ -605,7 +606,7 @@ static int tune_it(dvb_priv_t *priv, int fd_frontend, unsigned int delsys,
                 { .cmd = DTV_TUNE },
             };
             struct dtv_properties cmdseq = {
-                .num = sizeof(p) / sizeof(p[0]),
+                .num = MP_ARRAY_SIZE(p),
                 .props = p
             };
             if (dvbv5_tune(priv, fd_frontend, delsys, &cmdseq) != 0) {
@@ -633,7 +634,7 @@ int dvb_tune(dvb_priv_t *priv, unsigned int delsys,
              fe_transmit_mode_t TransmissionMode, fe_bandwidth_t bandWidth,
              fe_code_rate_t HP_CodeRate,
              fe_code_rate_t LP_CodeRate, fe_hierarchy_t hier,
-             int timeout)
+             float timeout)
 {
     MP_INFO(priv, "Tuning to %s frequency %lu Hz\n",
             get_dvb_delsys(delsys), (long unsigned int) freq);

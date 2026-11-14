@@ -22,22 +22,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "mpv_talloc.h"
 
-#include "misc/bstr.h"
 #include "common/common.h"
 #include "common/global.h"
 #include "misc/bstr.h"
+#include "misc/codepoint_width.h"
 #include "options/options.h"
 #include "options/path.h"
-#include "osdep/terminal.h"
 #include "osdep/io.h"
+#include "osdep/terminal.h"
 #include "osdep/threads.h"
 #include "osdep/timer.h"
 
-#include "libmpv/client.h"
+#include "mpv/client.h"
 
 #include "msg.h"
 #include "msg_control.h"
@@ -104,7 +103,7 @@ struct mp_log {
     const char *prefix;
     const char *verbose_prefix;
     int max_level;              // minimum log level for this instance
-    int level;                  // minimum log level for any outputs
+    atomic_int level;           // minimum log level for any outputs
     int terminal_level;         // minimum log level for terminal output
     atomic_ulong reload_counter;
     bstr partial[MSGL_MAX + 1];
@@ -142,26 +141,27 @@ static void update_loglevel(struct mp_log *log)
 {
     struct mp_log_root *root = log->root;
     mp_mutex_lock(&root->lock);
-    log->level = MSGL_STATUS + root->verbose; // default log level
+    int level = MSGL_STATUS + root->verbose; // default log level
     if (root->really_quiet)
-        log->level = -1;
+        level = -1;
     for (int n = 0; root->msg_levels && root->msg_levels[n * 2 + 0]; n++) {
         if (match_mod(log->verbose_prefix, root->msg_levels[n * 2 + 0]))
-            log->level = mp_msg_find_level(root->msg_levels[n * 2 + 1]);
+            level = mp_msg_find_level(root->msg_levels[n * 2 + 1]);
     }
-    log->terminal_level = log->level;
+    log->terminal_level = level;
     for (int n = 0; n < log->root->num_buffers; n++) {
         int buffer_level = log->root->buffers[n]->level;
         if (buffer_level == MP_LOG_BUFFER_MSGL_LOGFILE)
             buffer_level = MSGL_DEBUG;
         if (buffer_level != MP_LOG_BUFFER_MSGL_TERM)
-            log->level = MPMAX(log->level, buffer_level);
+            level = MPMAX(level, buffer_level);
     }
     if (log->root->log_file)
-        log->level = MPMAX(log->level, MSGL_DEBUG);
+        level = MPMAX(level, MSGL_DEBUG);
     if (log->root->stats_file)
-        log->level = MPMAX(log->level, MSGL_STATS);
-    log->level = MPMIN(log->level, log->max_level);
+        level = MPMAX(level, MSGL_STATS);
+    level = MPMIN(level, log->max_level);
+    atomic_store_explicit(&log->level, level, memory_order_relaxed);
     atomic_store(&log->reload_counter, atomic_load(&log->root->reload_counter));
     mp_mutex_unlock(&root->lock);
 }
@@ -190,13 +190,28 @@ int mp_msg_level(struct mp_log *log)
     {
         update_loglevel(log);
     }
-    return log->level;
+    return atomic_load_explicit(&log->level, memory_order_relaxed);
 }
 
 static inline int term_msg_fileno(struct mp_log_root *root, int lev)
 {
-    return (root->force_stderr || lev == MSGL_STATUS || lev == MSGL_FATAL ||
-            lev == MSGL_ERR || lev == MSGL_WARN) ? STDERR_FILENO : STDOUT_FILENO;
+    return root->force_stderr ? STDERR_FILENO : STDOUT_FILENO;
+}
+
+static inline FILE *term_msg_fp(struct mp_log_root *root, int lev)
+{
+    return term_msg_fileno(root, lev) == STDERR_FILENO ? stderr : stdout;
+}
+
+static inline bool is_status_output(struct mp_log_root *root, int lev)
+{
+    if (lev == MSGL_STATUS)
+        return true;
+    int msg_out = term_msg_fileno(root, lev);
+    int status_out = term_msg_fileno(root, MSGL_STATUS);
+    if (msg_out != status_out && root->isatty[msg_out] != root->isatty[status_out])
+        return false;
+    return true;
 }
 
 // Reposition cursor and clear lines for outputting the status line. In certain
@@ -206,6 +221,9 @@ static void prepare_prefix(struct mp_log_root *root, bstr *out, int lev, int ter
 {
     int new_lines = lev == MSGL_STATUS ? term_lines : 0;
     out->len = 0;
+
+    if (!is_status_output(root, lev))
+        return;
 
     if (!root->isatty[term_msg_fileno(root, lev)]) {
         if (root->status_lines)
@@ -228,7 +246,7 @@ static void prepare_prefix(struct mp_log_root *root, bstr *out, int lev, int ter
         bstr up_clear = bstr0("\033[A\033[K");
         for (int i = 1; i < root->status_lines; ++i)
             bstr_xappend(root, out, up_clear);
-        assert(root->status_lines > 0 && root->blank_lines >= root->status_lines);
+        mp_assert(root->status_lines > 0 && root->blank_lines >= root->status_lines);
         line_skip = root->blank_lines - root->status_lines;
     }
 
@@ -243,33 +261,43 @@ static void prepare_prefix(struct mp_log_root *root, bstr *out, int lev, int ter
     root->blank_lines += root->status_lines;
 }
 
+static void msg_flush_status_line(struct mp_log_root *root, bool clear)
+{
+    if (!root->status_lines)
+        goto done;
+
+    FILE *fp = term_msg_fp(root, MSGL_STATUS);
+    if (!clear) {
+        terminal_lock_output();
+        if (root->isatty[term_msg_fileno(root, MSGL_STATUS)])
+            fprintf(fp, TERM_ESC_RESTORE_CURSOR);
+        fprintf(fp, "\n");
+        terminal_unlock_output();
+        root->blank_lines = 0;
+        root->status_lines = 0;
+        goto done;
+    }
+
+    bstr term_msg = {0};
+    prepare_prefix(root, &term_msg, MSGL_STATUS, 0);
+    if (term_msg.len) {
+        terminal_lock_output();
+        fprintf(fp, "%.*s", BSTR_P(term_msg));
+        terminal_unlock_output();
+        talloc_free(term_msg.start);
+    }
+
+done:
+    root->status_line.len = 0;
+}
+
 void mp_msg_flush_status_line(struct mp_log *log, bool clear)
 {
     if (!log->root)
         return;
 
     mp_mutex_lock(&log->root->lock);
-    if (!log->root->status_lines)
-        goto done;
-
-    if (!clear) {
-        if (log->root->isatty[STDERR_FILENO])
-            fprintf(stderr, TERM_ESC_RESTORE_CURSOR);
-        fprintf(stderr, "\n");
-        log->root->blank_lines = 0;
-        log->root->status_lines = 0;
-        goto done;
-    }
-
-    bstr term_msg = {0};
-    prepare_prefix(log->root, &term_msg, MSGL_STATUS, 0);
-    if (term_msg.len) {
-        fprintf(stderr, "%.*s", BSTR_P(term_msg));
-        talloc_free(term_msg.start);
-    }
-
-done:
-    log->root->status_line.len = 0;
+    msg_flush_status_line(log->root, clear);
     mp_mutex_unlock(&log->root->lock);
 }
 
@@ -278,7 +306,9 @@ void mp_msg_set_term_title(struct mp_log *log, const char *title)
     if (log->root && title) {
         // Lock because printf to terminal is not necessarily atomic.
         mp_mutex_lock(&log->root->lock);
-        fprintf(stderr, "\033]0;%s\007", title);
+        terminal_lock_output();
+        fprintf(term_msg_fp(log->root, MSGL_STATUS), "\033]0;%s\007", title);
+        terminal_unlock_output();
         mp_mutex_unlock(&log->root->lock);
     }
 }
@@ -298,13 +328,27 @@ static void set_term_color(void *talloc_ctx, bstr *text, int c)
         bstr_xappend(talloc_ctx, text, bstr0("\033[0m"));
         return;
     }
-
-    bstr_xappend_asprintf(talloc_ctx, text, "\033[%d;3%dm", c >> 3, c & 7);
+    // Pure black to gray
+    if (c == 0)
+        c += 8;
+    // Pure white to light one
+    if (c == 15)
+        c -= 8;
+    bstr_xappend_asprintf(talloc_ctx, text, "\033[%d%dm", c >= 8 ? 9 : 3, c & 7);
 }
 
 static void set_msg_color(void *talloc_ctx, bstr *text, int lev)
 {
-    static const int v_colors[] = {9, 1, 3, -1, -1, 2, 8, 8, 8, -1};
+    static const int v_colors[] = {
+        [MSGL_FATAL]  = 9,  // bright red
+        [MSGL_ERR]    = 1,  // red
+        [MSGL_WARN]   = 3,  // yellow
+        [MSGL_INFO]   = -1, // default
+        [MSGL_STATUS] = -1, // default
+        [MSGL_V]      = 2,  // green
+        [MSGL_DEBUG]  = 4,  // blue
+        [MSGL_TRACE]  = 8,  // bright black aka. gray
+    };
     set_term_color(talloc_ctx, text, v_colors[lev]);
 }
 
@@ -337,39 +381,8 @@ static bool test_terminal_level(struct mp_log *log, int lev)
            !(lev == MSGL_STATUS && terminal_in_background());
 }
 
-// This is very basic way to infer needed width for a string.
-static int term_disp_width(bstr str)
-{
-    int width = 0;
-
-    while (str.len) {
-        if (bstr_eatstart0(&str, "\033[")) {
-            while (str.len && !((*str.start >= '@' && *str.start <= '~') || *str.start == 'm'))
-                str = bstr_cut(str, 1);
-            str = bstr_cut(str, 1);
-            continue;
-        }
-
-        bstr code = bstr_split_utf8(str, &str);
-        if (code.len == 0)
-            return 0;
-
-        if (code.len == 1 && *code.start == '\n')
-            continue;
-
-        // Only single-width characters are supported
-        width++;
-
-        // Assume that everything before \r should be discarded for simplicity
-        if (code.len == 1 && *code.start == '\r')
-            width = 0;
-    }
-
-    return width;
-}
-
 static void append_terminal_line(struct mp_log *log, int lev,
-                                 bstr text, bstr *term_msg, int *line_w)
+                                 bstr text, bstr *term_msg, int *line_w, int term_w)
 {
     struct mp_log_root *root = log->root;
 
@@ -389,17 +402,57 @@ static void append_terminal_line(struct mp_log *log, int lev,
     }
 
     bstr_xappend(root, term_msg, text);
-    *line_w = root->isatty[term_msg_fileno(root, lev)]
-                ? term_disp_width(bstr_splice(*term_msg, start, term_msg->len)) : 0;
+
+    const unsigned char *cut_pos = NULL;
+    int ellipsis_width = 2;
+    int width = term_disp_width(bstr_splice(*term_msg, start, term_msg->len),
+                                term_w - ellipsis_width, &cut_pos);
+    if (cut_pos) {
+        int new_len = cut_pos - term_msg->start;
+        bstr rem = bstrdup(NULL, (bstr){(unsigned char *)cut_pos, term_msg->len - new_len});
+        void *ptr = rem.start;
+        term_msg->len = new_len;
+
+        bstr_xappend(root, term_msg, bstr0(".."));
+
+        while (rem.len) {
+            if (bstr_eatstart0(&rem, "\n")) {
+                bstr_xappend(root, term_msg, bstr0("\n"));
+                continue;
+            }
+            if (bstr_eatstart0(&rem, "\033[")) {
+                bstr_xappend(root, term_msg, bstr0("\033["));
+
+                while (rem.len && !((*rem.start >= '@' && *rem.start <= '~') || *rem.start == 'm')) {
+                    bstr_xappend(root, term_msg, bstr_splice(rem, 0, 1));
+                    rem = bstr_cut(rem, 1);
+                }
+                bstr_xappend(root, term_msg, bstr_splice(rem, 0, 1));
+            }
+            rem = bstr_cut(rem, 1);
+        }
+        talloc_free(ptr);
+
+        width += ellipsis_width;
+    }
+    *line_w = root->isatty[term_msg_fileno(root, lev)] ? width : 0;
 }
 
 static struct mp_log_buffer_entry *log_buffer_read(struct mp_log_buffer *buffer)
 {
-    assert(buffer->num_entries);
+    mp_assert(buffer->num_entries);
     struct mp_log_buffer_entry *res = buffer->entries[buffer->entry0];
     buffer->entry0 = (buffer->entry0 + 1) % buffer->capacity;
     buffer->num_entries -= 1;
     return res;
+}
+
+static bool log_buffer_full(struct mp_log_buffer *buffer)
+{
+    mp_mutex_lock(&buffer->lock);
+    bool full = buffer->num_entries == buffer->capacity;
+    mp_mutex_unlock(&buffer->lock);
+    return full;
 }
 
 static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
@@ -418,17 +471,14 @@ static void write_msg_to_buffers(struct mp_log *log, int lev, bstr text)
             if (buffer->level == MP_LOG_BUFFER_MSGL_LOGFILE) {
                 // If the buffer is full, block until we can write again,
                 // unless there's no write thread (died, or early filebuffer)
-                bool dead = false;
-                while (buffer->num_entries == buffer->capacity && !dead) {
+                if (buffer->num_entries == buffer->capacity) {
                     // Temporary unlock is OK; buffer->level is immutable, and
                     // buffer can't go away because the global log lock is held.
                     mp_mutex_unlock(&buffer->lock);
                     mp_mutex_lock(&root->log_file_lock);
-                    if (root->log_file_thread_active) {
+                    while (root->log_file_thread_active && log_buffer_full(buffer)) {
                         mp_cond_wait(&root->log_file_wakeup,
                                           &root->log_file_lock);
-                    } else {
-                        dead = true;
                     }
                     mp_mutex_unlock(&root->log_file_lock);
                     mp_mutex_lock(&buffer->lock);
@@ -484,14 +534,16 @@ static void write_term_msg(struct mp_log *log, int lev, bstr text, bstr *out)
     while (str.len) {
         bstr line = bstr_getline(str, &str);
         if (line.start[line.len - 1] != '\n') {
-            assert(str.len == 0);
+            mp_assert(str.len == 0);
             str = line;
             break;
         }
 
+        bool clip = bstr_eatstart0(&line, TERM_MSG_0);
         if (print_term) {
             int line_w;
-            append_terminal_line(log, lev, line, &root->term_msg_tmp, &line_w);
+            append_terminal_line(log, lev, line, &root->term_msg_tmp, &line_w,
+                                 clip && term_w ? term_w : INT_MAX);
             term_msg_lines += (!line_w || !term_w)
                                 ? 1 : (line_w + term_w - 1) / term_w;
         }
@@ -500,8 +552,10 @@ static void write_term_msg(struct mp_log *log, int lev, bstr text, bstr *out)
 
     if (lev == MSGL_STATUS) {
         int line_w = 0;
+        bool clip = bstr_eatstart0(&str, TERM_MSG_0);
         if (str.len && print_term)
-            append_terminal_line(log, lev, str, &root->term_msg_tmp, &line_w);
+            append_terminal_line(log, lev, str, &root->term_msg_tmp, &line_w,
+                                 clip && term_w ? term_w : INT_MAX);
         term_msg_lines += !term_w ? (str.len ? 1 : 0)
                                   : (line_w + term_w - 1) / term_w;
     } else if (str.len) {
@@ -518,6 +572,84 @@ static void write_term_msg(struct mp_log *log, int lev, bstr text, bstr *out)
     }
 }
 
+void mp_msg_sanitize(bstr *text, bool allow_sgr)
+{
+    for (size_t i = 0; i < text->len; i++) {
+        unsigned char ch = text->start[i];
+
+        // Allow SGR escape sequences only, filter anything else.
+        if (allow_sgr && ch == 0x1B && i + 2 < text->len && text->start[i + 1] == '[') {
+            size_t j = i + 2;
+            bool sgr = false;
+
+            while (j < text->len) {
+                unsigned char c = text->start[j];
+                if (c == 'm') {
+                    sgr = true;
+                    i = j;
+                    break;
+                } else if ((c >= '0' && c <= '9') || c == ';' || c == ':') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+
+            // Nuke everything that is not an SGR sequence
+            if (!sgr)
+                text->start[i] = '?';
+            continue;
+        }
+
+        int len = bstr_parse_utf8_code_length(ch);
+
+        // ASCII: allow only printable plus HT, LF, CR.
+        if (len == 1) {
+            if (ch == 0x7F || (ch < 0x20 && ch != '\t' && ch != '\n' && ch != '\r'))
+                text->start[i] = '?';
+            continue;
+        }
+
+        // Block UTF-8 C1 controls (C2 80..C2 9F), except PU1/PU2 used internally.
+        if (ch == 0xC2 && i + 1 < text->len && (text->start[i + 1] & 0xC0) == 0x80) {
+            unsigned char c1 = text->start[i + 1];
+            if (c1 >= 0x80 && c1 <= 0x9F && c1 != 0x91 && c1 != 0x92) {
+                text->start[i] = '?';
+                text->start[i + 1] = '?';
+            }
+            i++;
+            continue;
+        }
+
+        // Skip valid multi-byte sequences so continuation bytes aren't seen as
+        // raw C1. Reject overlong 0xC0/0xC1 and verify the bytes before skipping.
+        if (len >= 2 && ch >= 0xC2 && i + len <= text->len) {
+            bool valid = true;
+            for (int n = 1; n < len; n++)
+                valid &= (text->start[i + n] & 0xC0) == 0x80;
+            if (valid) {
+                i += len - 1;
+                continue;
+            }
+        }
+
+        // Block raw 8-bit C1 (0x80-0x9F); leave other invalid bytes alone.
+        if (ch <= 0x9F)
+            text->start[i] = '?';
+    }
+}
+
+// Start of a UTF-8 sequence at the end of str that more text may complete.
+static size_t utf8_tail_start(bstr str)
+{
+    for (size_t n = 1; n <= 4 && n <= str.len; n++) {
+        unsigned char ch = str.start[str.len - n];
+        if ((ch & 0xC0) != 0x80)
+            return ch >= 0xC0 ? str.len - n : str.len;
+    }
+    return str.len;
+}
+
 void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
 {
     if (!mp_msg_test(log, lev))
@@ -529,11 +661,20 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
 
     root->buffer.len = 0;
 
+    // The partial line is sanitized already, except for a UTF-8 sequence at
+    // its end that the new text may complete.
+    size_t sanitized = utf8_tail_start(log->partial[lev]);
     if (log->partial[lev].len)
         bstr_xappend(root, &root->buffer, log->partial[lev]);
     log->partial[lev].len = 0;
 
-    bstr_xappend_vasprintf(root, &root->buffer, format, va);
+    if (bstr_xappend_vasprintf(root, &root->buffer, format, va) < 0) {
+        bstr_xappend(root, &root->buffer, bstr0("format error: "));
+        bstr_xappend(root, &root->buffer, bstr0(format));
+    }
+
+    bstr text = {root->buffer.start + sanitized, root->buffer.len - sanitized};
+    mp_msg_sanitize(&text, true);
 
     // Remember last status message and restore it to ensure that it is
     // always displayed
@@ -552,21 +693,21 @@ void mp_msg_va(struct mp_log *log, int lev, const char *format, va_list va)
     } else {
         write_term_msg(log, lev, root->buffer, &root->term_msg);
 
-        root->term_status_msg.len = 0;
-        if (lev != MSGL_STATUS && root->status_line.len && root->status_log &&
-            test_terminal_level(root->status_log, MSGL_STATUS))
-        {
-            write_term_msg(root->status_log, MSGL_STATUS, root->status_line,
-                           &root->term_status_msg);
-        }
-
-        int fileno = term_msg_fileno(root, lev);
-        FILE *stream = fileno == STDERR_FILENO ? stderr : stdout;
+        FILE *stream = term_msg_fp(root, lev);
         if (root->term_msg.len) {
+            root->term_status_msg.len = 0;
+            if (lev != MSGL_STATUS && root->status_line.len && root->status_log &&
+                is_status_output(root, lev) && test_terminal_level(root->status_log, MSGL_STATUS))
+            {
+                write_term_msg(root->status_log, MSGL_STATUS, root->status_line,
+                               &root->term_status_msg);
+            }
+            terminal_lock_output();
             fwrite(root->term_msg.start, root->term_msg.len, 1, stream);
             if (root->term_status_msg.len)
                 fwrite(root->term_status_msg.start, root->term_status_msg.len, 1, stream);
             fflush(stream);
+            terminal_unlock_output();
         }
     }
 
@@ -594,7 +735,7 @@ static void destroy_log(void *ptr)
 struct mp_log *mp_log_new(void *talloc_ctx, struct mp_log *parent,
                           const char *name)
 {
-    assert(parent);
+    mp_assert(parent);
     struct mp_log *log = talloc_zero(talloc_ctx, struct mp_log);
     if (!parent->root)
         return log; // same as null_log
@@ -628,7 +769,7 @@ struct mp_log *mp_log_new(void *talloc_ctx, struct mp_log *parent,
 
 void mp_msg_init(struct mpv_global *global)
 {
-    assert(!global->log);
+    mp_assert(!global->log);
 
     struct mp_log_root *root = talloc_zero(NULL, struct mp_log_root);
     *root = (struct mp_log_root){
@@ -850,12 +991,15 @@ void mp_msg_uninit(struct mpv_global *global)
 {
     struct mp_log_root *root = global->log->root;
     mp_msg_flush_status_line(global->log, true);
-    if (root->really_quiet && root->isatty[STDERR_FILENO])
-        fprintf(stderr, TERM_ESC_RESTORE_CURSOR);
+    if (root->really_quiet && root->isatty[term_msg_fileno(root, MSGL_STATUS)]) {
+        terminal_lock_output();
+        fprintf(term_msg_fp(root, MSGL_STATUS), TERM_ESC_RESTORE_CURSOR);
+        terminal_unlock_output();
+    }
     terminate_log_file_thread(root);
     mp_msg_log_buffer_destroy(root->early_buffer);
     mp_msg_log_buffer_destroy(root->early_filebuffer);
-    assert(root->num_buffers == 0);
+    mp_assert(root->num_buffers == 0);
     if (root->stats_file)
         fclose(root->stats_file);
     talloc_free(root->stats_path);
@@ -899,7 +1043,7 @@ static void mp_msg_set_early_logging_raw(struct mpv_global *global, bool enable,
             struct mp_log_buffer *buf =
                 mp_msg_log_buffer_new(global, size, level, NULL, NULL);
             mp_mutex_lock(&root->lock);
-            assert(!*root_logbuf); // no concurrent calls to this function
+            mp_assert(!*root_logbuf); // no concurrent calls to this function
             *root_logbuf = buf;
         } else {
             struct mp_log_buffer *buf = *root_logbuf;
@@ -950,7 +1094,7 @@ struct mp_log_buffer *mp_msg_log_buffer_new(struct mpv_global *global,
         }
     }
 
-    assert(size > 0);
+    mp_assert(size > 0);
 
     struct mp_log_buffer *buffer = talloc_ptrtype(NULL, buffer);
     *buffer = (struct mp_log_buffer) {
@@ -976,7 +1120,7 @@ void mp_msg_log_buffer_resize(struct mp_log_buffer *buffer, int size)
 {
     mp_mutex_lock(&buffer->lock);
 
-    assert(size > 0);
+    mp_assert(size > 0);
     if (buffer->capacity < size &&
         buffer->entry0 + buffer->num_entries <= buffer->capacity) {
         // shortcut if buffer doesn't wrap

@@ -32,6 +32,7 @@
 #include "osdep/threads.h"
 
 #include <libavutil/avutil.h>
+#include <libavutil/ffversion.h>
 #include <libavutil/log.h>
 #include <libavutil/version.h>
 
@@ -194,15 +195,22 @@ struct lib {
 void check_library_versions(struct mp_log *log, int v)
 {
     const struct lib libs[] = {
-        {"libavutil",     LIBAVUTIL_VERSION_INT,     avutil_version()},
         {"libavcodec",    LIBAVCODEC_VERSION_INT,    avcodec_version()},
-        {"libavformat",   LIBAVFORMAT_VERSION_INT,   avformat_version()},
-        {"libswscale",    LIBSWSCALE_VERSION_INT,    swscale_version()},
+#if HAVE_LIBAVDEVICE
+        {"libavdevice",   LIBAVDEVICE_VERSION_INT,   avdevice_version()},
+#endif
         {"libavfilter",   LIBAVFILTER_VERSION_INT,   avfilter_version()},
+        {"libavformat",   LIBAVFORMAT_VERSION_INT,   avformat_version()},
+        {"libavutil",     LIBAVUTIL_VERSION_INT,     avutil_version()},
         {"libswresample", LIBSWRESAMPLE_VERSION_INT, swresample_version()},
+        {"libswscale",    LIBSWSCALE_VERSION_INT,    swscale_version()},
     };
 
-    mp_msg(log, v, "FFmpeg version: %s\n", av_version_info());
+    const char *runtime_version = av_version_info();
+    mp_msg(log, v, "FFmpeg version: %s", FFMPEG_VERSION);
+    if (strcmp(runtime_version, FFMPEG_VERSION))
+        mp_msg(log, v, " (runtime %s)", runtime_version);
+    mp_msg(log, v, "\n");
     mp_msg(log, v, "FFmpeg library versions:\n");
 
     for (int n = 0; n < MP_ARRAY_SIZE(libs); n++) {
@@ -214,9 +222,9 @@ void check_library_versions(struct mp_log *log, int v)
         if (l->buildv > l->runv ||
             AV_VERSION_MAJOR(l->buildv) != AV_VERSION_MAJOR(l->runv))
         {
-            fprintf(stderr, "%s: %d.%d.%d -> %d.%d.%d\n",
-                    l->name, V(l->buildv), V(l->runv));
-            abort();
+            mp_fatal(log, "%s: build version %d.%d.%d incompatible with runtime version %d.%d.%d\n",
+                     l->name, V(l->buildv), V(l->runv));
+            exit(1);
         }
     }
 }

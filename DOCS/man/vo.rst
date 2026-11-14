@@ -10,16 +10,33 @@ syntax is:
 If the list has a trailing ``,``, mpv will fall back on drivers not contained
 in the list.
 
+This is an object settings list option. See `List Options`_ for details.
+
 .. note::
 
     See ``--vo=help`` for a list of compiled-in video output drivers.
 
-    The recommended output driver is ``--vo=gpu``, which is the default. All
-    other drivers are for compatibility or special purposes. If the default
+    The recommended output driver is ``--vo=gpu-next``, which is the default.
+    All other drivers are for compatibility or special purposes. If the default
     does not work, it will fallback to other drivers (in the same order as
     listed by ``--vo=help``).
 
+    Note that the default video output driver is subject to change, and must
+    not be relied upon. If a certain VO needs to be used (e.g. for ``libmpv``
+    rendering API), it must be explicitly specified.
+
 Available video output drivers are:
+
+``gpu-next``
+    Video renderer based on ``libplacebo``. This supports almost the same set
+    of features as ``--vo=gpu``. See `GPU renderer options`_ for a list.
+
+    Should generally be faster and higher quality, while also implementing some
+    features specific to ``gpu-next``, but some features may be intentionally
+    omitted or there may be functional differences to ``--vo=gpu``.
+    See here for a list of known differences:
+
+    https://github.com/mpv-player/mpv/wiki/GPU-Next-vs-GPU
 
 ``gpu``
     General purpose, customizable, GPU-accelerated video output driver. It
@@ -50,17 +67,6 @@ Available video output drivers are:
     support, and some macOS setups being very slow with ``rgb16`` but fast
     with ``rgb32f``. If you have problems, you can also try enabling the
     ``--gpu-dumb-mode=yes`` option.
-
-``gpu-next``
-    Experimental video renderer based on ``libplacebo``. This supports almost
-    the same set of features as ``--vo=gpu``. See `GPU renderer options`_ for a
-    list.
-
-    Should generally be faster and higher quality, but some features may still
-    be missing or misbehave. Expect (and report!) bugs. See here for a list of
-    known differences and bugs:
-
-    https://github.com/mpv-player/mpv/wiki/GPU-Next-vs-GPU
 
 ``xv`` (X11 only)
     Uses the XVideo extension to enable hardware-accelerated display. This is
@@ -112,8 +118,7 @@ Available video output drivers are:
     Shared memory video output driver without hardware acceleration that works
     whenever X11 is present.
 
-    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
-    performance.
+    You may need to use ``--profile=sw-fast`` to get decent performance.
 
     .. note:: This is a fallback only, and should not be normally used.
 
@@ -288,7 +293,7 @@ Available video output drivers are:
         Instruct SDL to switch the monitor video mode when going fullscreen.
 
 ``dmabuf-wayland``
-    Experimental Wayland output driver designed for use with either drm stateless
+    Special Wayland output driver designed for use with either drm stateless
     or VA API hardware decoding. The driver is designed to avoid any GPU to CPU copies,
     and to perform scaling and color space conversion using fixed-function hardware,
     if available, rather than GPU shaders. This frees up GPU resources for other tasks.
@@ -296,14 +301,24 @@ Available video output drivers are:
     as ``auto-safe``. It can still work in some circumstances without ``--hwdec`` due to
     mpv's internal conversion filters, but this is not recommended as it's a needless
     extra step. Correct output depends on support from your GPU, drivers, and compositor.
-    Weston and wlroots-based compositors like Sway and Intel GPUs are known to generally
-    work.
+    This requires the compositor and mpv to support ``color-management-v1`` to
+    accurately display colorspaces that are different from the compositor
+    default (bt.601 in most cases).
+
+    .. warning::
+
+        This driver is not required for mpv to work on Wayland. ``vo=gpu``
+        and ``vo=gpu-next`` will switch to the appropriate Wayland context
+        automatically. This video output is geared towards power efficiency
+        and has generally lower quality than ``gpu``/``gpu-next``.
 
 ``vaapi``
     Intel VA API video output driver with support for hardware decoding. Note
     that there is absolutely no reason to use this, other than compatibility.
     This is low quality, and has issues with OSD. We strongly recommend that
     you use ``--vo=gpu`` with ``--hwdec=vaapi`` instead.
+
+    .. warning:: This VO is deprecated will be removed next release.
 
     The following global options are supported by this video output:
 
@@ -359,8 +374,7 @@ Available video output drivers are:
     the images at full color range, but 256-colors output is also supported (see
     below). On Windows it requires an ansi terminal such as mintty.
 
-    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
-    performance.
+    You may need to use ``--profile=sw-fast`` to get decent performance.
 
     Note: the TCT image output is not synchronized with other terminal output
     from mpv, which can lead to broken images. The options ``--terminal=no`` or
@@ -370,30 +384,11 @@ Available video output drivers are:
         Select how to write the pixels to the terminal.
 
         half-blocks
-            Uses unicode LOWER HALF BLOCK character to achieve higher vertical
+            Uses Unicode LOWER HALF BLOCK character to achieve higher vertical
             resolution. (Default.)
         plain
             Uses spaces. Causes vertical resolution to drop twofolds, but in
             theory works in more places.
-
-    ``--vo-tct-buffering=<pixel|line|frame>``
-        Specifies the size of data batches buffered before being sent to the
-        terminal.
-
-        TCT image output is not synchronized with other terminal output from mpv,
-        which can lead to broken images. Sending data to the terminal in small
-        batches may improve parallelism between terminal processing and mpv
-        processing but incurs a static overhead of generating tens of thousands
-        of small writes. Also, depending on the terminal used, sending frames in
-        one chunk might help with tearing of the output, especially if not used
-        with ``--really-quiet`` and other logs interrupt the data stream.
-
-        pixel
-            Send data to terminal for each pixel.
-        line
-            Send data to terminal for each line. (Default)
-        frame
-            Send data to terminal for each frame.
 
     ``--vo-tct-width=<width>``  ``--vo-tct-height=<height>``
         Assume the terminal has the specified character width and/or height.
@@ -441,15 +436,17 @@ Available video output drivers are:
 
         This option is not implemented on Windows.
 
+    ``--vo-kitty-auto-multiplexer-passthrough=<yes|no>`` (default: no)
+        Automatically detect terminal multiplexer to passthrough escape
+        sequences. This allows the image protocol to work in multiplexers that
+        might not support the kitty image protocol by passing through the
+        escape sequences directly to the terminal.
+
+        Currently only supports tmux and GNU screen.
+
 ``sixel``
     Graphical output for the terminal, using sixels. Tested with ``mlterm`` and
     ``xterm``.
-
-    Note: the Sixel image output is not synchronized with other terminal
-    output from mpv, which can lead to broken images.
-    The option ``--really-quiet`` can help with that, and is recommended.
-    On some platforms, using the ``--vo-sixel-buffered`` option may work as
-    well.
 
     You may need to use ``--profile=sw-fast`` to get decent performance.
 
@@ -469,21 +466,20 @@ Available video output drivers are:
     Sixel size and alignment options:
 
     ``--vo-sixel-cols=<columns>``, ``--vo-sixel-rows=<rows>`` (default: 0)
-        Specify the terminal size in character cells, otherwise (0) read it
-        from the terminal, or fall back to 80x25. Note that mpv doesn't use the
-        the last row with sixel because this seems to result in scrolling.
+        Size of the area the image may use, in character cells. The default
+        (0) is the terminal size from the position the image starts at, or
+        80x25 if the terminal size cannot be read. The last row is left free
+        for the status line.
 
     ``--vo-sixel-width=<width>``, ``--vo-sixel-height=<height>`` (default: 0)
-        Specify the available size in pixels, otherwise (0) read it from the
-        terminal, or fall back to 320x240. Other than excluding the last line,
-        the height is also further rounded down to a multiple of 6 (sixel unit
-        height) to avoid overflowing below the designated size.
+        Size of the area the image may use, in pixels. The default (0) is what
+        the terminal reports for the rows and columns above, or 320x240 if it
+        reports nothing. Other than excluding the last row, the height is
+        rounded down to a multiple of 6, the height of a sixel band.
 
     ``--vo-sixel-left=<col>``, ``--vo-sixel-top=<row>`` (default: 0)
-        Specify the position in character cells where the image starts (1 is
-        the first column or row). If 0 (default) then try to automatically
-        determine it according to the other values and the image aspect ratio
-        and zoom.
+        Position in character cells where the area the image may use starts
+        (1 is the first column or row). 0 (default) is the same as 1.
 
     ``--vo-sixel-pad-x=<pad_x>``, ``--vo-sixel-pad-y=<pad_y>`` (default: -1)
         Used only when mpv reads the size in pixels from the terminal.
@@ -501,16 +497,6 @@ Available video output drivers are:
         Whether or not to use the alternate screen buffer and return the
         terminal to its previous state on exit. When set to no, the last
         sixel image stays on screen after quit, with the cursor following it.
-
-        ``--vo-sixel-exit-clear`` is a deprecated alias for this option and
-        may be removed in the future.
-
-    ``--vo-sixel-buffered=<yes|no>`` (default: no)
-        Buffers the full output sequence before writing it to the terminal.
-        On POSIX platforms, this can help prevent interruption (including from
-        other applications) and thus broken images, but may come at a
-        performance cost with some terminals and is subject to implementation
-        details.
 
     Sixel image quality options:
 
@@ -607,8 +593,7 @@ Available video output drivers are:
     environment (e.g. no X). Does not support hardware acceleration (if you
     need this, check the ``drm`` backend for ``gpu`` VO).
 
-    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
-    performance.
+    You may need to use ``--profile=sw-fast`` to get decent performance.
 
     The following global options are supported by this video output:
 
@@ -661,12 +646,13 @@ Available video output drivers are:
         lower resolution (the video when handled by the hwdec will be on the
         drmprime-video plane and at full 4K resolution)
 
-    ``--drm-format=<xrgb8888|xbgr8888|xrgb2101010|xbgr2101010|yuyv>``
+    ``--drm-format=<xrgb8888|xbgr8888|xrgb2101010|xbgr2101010|rgb565|yuyv>``
         Select the DRM format to use (default: xrgb8888). This allows you to
         choose the bit depth and color type of the DRM mode.
 
         xrgb8888 is your usual 24bpp packed RGB format with 8 bits of padding.
         xrgb2101010 is a 30bpp packed RGB format with 2 bits of padding.
+        rgb565 is a 16bpp packed RGB format with reduced colour accuracy.
         yuyv is a 32bpp packed YUV 4:2:2 format. No planar formats are currently
         supported.
 
@@ -717,7 +703,6 @@ Available video output drivers are:
     Shared memory video output driver without hardware acceleration that works
     whenever Wayland is present.
 
-    Since mpv 0.30.0, you may need to use ``--profile=sw-fast`` to get decent
-    performance.
+    You may need to use ``--profile=sw-fast`` to get decent performance.
 
     .. note:: This is a fallback only, and should not be normally used.

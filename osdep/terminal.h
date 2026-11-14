@@ -38,6 +38,9 @@
 #define TERM_ESC_ENABLE_MOUSE       "\033[?1003h"
 #define TERM_ESC_DISABLE_MOUSE      "\033[?1003l"
 
+#define TERM_ESC_REVERSE_COLORS     "\033[7m"
+#define TERM_ESC_CLEAR_COLORS       "\033[0m"
+
 struct input_ctx;
 
 /* Global initialization for terminal output. */
@@ -61,8 +64,16 @@ void terminal_get_size2(int *rows, int *cols, int *px_width, int *px_height);
 /* Enable/Disable mouse input. */
 void terminal_set_mouse_input(bool enable);
 
+/* Sets notification callback for when terminal is resized. */
+bool terminal_set_resize_callback(void (*cb)(void *ctx), void *ctx);
+
+/* Serialize writes to the terminal. */
+void terminal_lock_output(void);
+void terminal_unlock_output(void);
+
 // Windows only.
-int mp_console_vfprintf(void *wstream, const char *format, va_list args);
+int mp_console_vfprintf(void *wstream, const char *format, va_list args)
+    MP_PRINTF_ATTRIBUTE(2, 0);
 int mp_console_write(void *wstream, bstr str);
 bool mp_check_console(void *handle);
 

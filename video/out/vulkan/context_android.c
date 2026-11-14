@@ -53,7 +53,7 @@ static bool android_init(struct ra_ctx *ctx)
          .window = vo_android_native_window(ctx->vo)
     };
 
-    struct ra_vk_ctx_params params = {0};
+    struct ra_ctx_params params = {0};
 
     VkInstance inst = vk->vkinst->instance;
     VkResult res = vkCreateAndroidSurfaceKHR(inst, &info, NULL, &vk->surface);
@@ -76,6 +76,13 @@ static bool android_reconfig(struct ra_ctx *ctx)
     int w, h;
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
+
+    // Update window geometry to prevent screen tearing
+    ANativeWindow *native_window = vo_android_native_window(ctx->vo);
+    if (native_window) {
+        int32_t current_format = ANativeWindow_getFormat(native_window);
+        ANativeWindow_setBuffersGeometry(native_window, w, h, current_format);
+    }
 
     ra_vk_ctx_resize(ctx, w, h);
     return true;

@@ -29,13 +29,16 @@
 #include "config.h"
 #include "options/m_config.h"
 #include "options/options.h"
+#include "options/path.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "demux/demux.h"
+#include "demux/packet_pool.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
 #include "dec_sub.h"
 #include "ass_mp.h"
+#include "packer.h"
 #include "sd.h"
 
 struct sd_ass_priv {
@@ -49,7 +52,7 @@ struct sd_ass_priv {
     struct sd_filter **filters;
     int num_filters;
     bool clear_once;
-    struct mp_ass_packer *packer;
+    struct mp_sub_packer *packer;
     struct sub_bitmap_copy_cache *copy_cache;
     bstr last_text;
     struct mp_image_params video_params;
@@ -57,14 +60,41 @@ struct sd_ass_priv {
     struct mp_osd_res osd;
     struct seen_packet *seen_packets;
     int num_seen_packets;
-    bool *packets_animated;
-    int num_packets_animated;
-    bool duration_unknown;
+    bool check_animated;
 };
 
 struct seen_packet {
-    int64_t pos;
+    int64_t sig;
     double pts;
+    int animated; // -1 is unknown
+};
+
+#undef OPT_BASE_STRUCT
+#define OPT_BASE_STRUCT struct mp_sub_filter_opts
+
+const struct m_sub_options mp_sub_filter_opts = {
+    .opts = (const struct m_option[]){
+        {"sdh", OPT_BOOL(sub_filter_SDH)},
+        {"sdh-harder", OPT_BOOL(sub_filter_SDH_harder)},
+        {"sdh-enclosures", OPT_STRINGLIST(sub_filter_SDH_enclosures)},
+        {"regex-enable", OPT_BOOL(rf_enable)},
+        {"regex-plain", OPT_BOOL(rf_plain)},
+        {"regex", OPT_STRINGLIST(rf_items)},
+        {"jsre", OPT_STRINGLIST(jsre_items)},
+        {"regex-warn", OPT_BOOL(rf_warn)},
+        {0}
+    },
+    .size = sizeof(OPT_BASE_STRUCT),
+    .defaults = &(OPT_BASE_STRUCT){
+        .sub_filter_SDH_enclosures = (char *[]) {
+            "()",
+            "[]",
+            "\uFF08\uFF09",
+            NULL
+        },
+        .rf_enable = true,
+    },
+    .change_flags = UPDATE_SUB_FILT,
 };
 
 static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts);
@@ -84,11 +114,14 @@ static const struct sd_filter_functions *const filters[] = {
 
 // Add default styles, if the track does not have any styles yet.
 // Apply style overrides if the user provides any.
-static void mp_ass_add_default_styles(ASS_Track *track, struct mp_subtitle_opts *opts,
-                                      struct mp_subtitle_shared_opts *shared_opts, int order)
+static void mp_ass_add_default_styles(struct sd *sd, ASS_Track *track, struct mp_subtitle_opts *opts,
+                                      struct mp_subtitle_shared_opts *shared_opts)
 {
-    if (opts->ass_styles_file && shared_opts->ass_style_override[order])
-        ass_read_styles(track, opts->ass_styles_file, NULL);
+    if (opts->ass_styles_file && shared_opts->ass_style_override[sd->order]) {
+        char *file = mp_get_user_path(NULL, sd->global, opts->ass_styles_file);
+        ass_read_styles(track, file, NULL);
+        talloc_free(file);
+    }
 
     if (track->n_styles == 0) {
         if (!track->PlayResY) {
@@ -103,13 +136,14 @@ static void mp_ass_add_default_styles(ASS_Track *track, struct mp_subtitle_opts 
         mp_ass_set_style(style, track->PlayResY, opts->sub_style);
     }
 
-    if (shared_opts->ass_style_override[order])
+    if (shared_opts->ass_style_override[sd->order])
         ass_process_force_style(track);
 }
 
 static const char *const font_mimetypes[] = {
     "application/x-truetype-font",
     "application/vnd.ms-opentype",
+    "application/x-font-otf",
     "application/x-font-ttf",
     "application/x-font", // probably incorrect
     "application/font-sfnt",
@@ -181,6 +215,7 @@ static void filters_init(struct sd *sd)
         *ft = (struct sd_filter){
             .global = sd->global,
             .log = sd->log,
+            .packet_pool = demux_packet_pool_get(sd->global),
             .opts = mp_get_config_group(ft, sd->global, &mp_sub_filter_opts),
             .driver = filters[n],
             .codec = "ass",
@@ -230,7 +265,7 @@ static void assobjects_init(struct sd *sd)
     ctx->shadow_track = ass_new_track(ctx->ass_library);
     ctx->shadow_track->PlayResX = MP_ASS_FONT_PLAYRESX;
     ctx->shadow_track->PlayResY = MP_ASS_FONT_PLAYRESY;
-    mp_ass_add_default_styles(ctx->shadow_track, opts, shared_opts, sd->order);
+    mp_ass_add_default_styles(sd, ctx->shadow_track, opts, shared_opts);
 
     char *extradata = sd->codec->extradata;
     int extradata_size = sd->codec->extradata_size;
@@ -241,13 +276,18 @@ static void assobjects_init(struct sd *sd)
     if (extradata)
         ass_process_codec_private(ctx->ass_track, extradata, extradata_size);
 
-    mp_ass_add_default_styles(ctx->ass_track, opts, shared_opts, sd->order);
+    mp_ass_add_default_styles(sd, ctx->ass_track, opts, shared_opts);
 
 #if LIBASS_VERSION >= 0x01302000
     ass_set_check_readorder(ctx->ass_track, sd->opts->sub_clear_on_seek ? 0 : 1);
 #endif
 
+#if LIBASS_VERSION >= 0x01703010
+    ass_configure_prune(ctx->ass_track, sd->opts->ass_prune_delay * 1000.0);
+#endif
+
     enable_output(sd, true);
+    ass_set_cache_limits(ctx->ass_renderer, sd->opts->sub_glyph_limit, sd->opts->sub_bitmap_max_size);
 }
 
 static void assobjects_destroy(struct sd *sd)
@@ -274,59 +314,56 @@ static int init(struct sd *sd)
         ctx->converter = lavc_conv_create(sd);
         if (!ctx->converter)
             return -1;
-
-        if (strcmp(sd->codec->codec, "eia_608") == 0)
-            ctx->duration_unknown = 1;
     }
 
     assobjects_init(sd);
     filters_init(sd);
 
-    ctx->packer = mp_ass_packer_alloc(ctx);
+    ctx->packer = mp_sub_packer_alloc(ctx);
+
+    // Subtitles does not have any profile value, so put the converted type as a profile.
+    const char *_Atomic *desc = ctx->converter ? &sd->codec->codec_profile : &sd->codec->codec_desc;
+    switch (ctx->ass_track->track_type) {
+    case TRACK_TYPE_ASS:
+        *desc = "Advanced Sub Station Alpha";
+        break;
+    case TRACK_TYPE_SSA:
+        *desc = "Sub Station Alpha";
+        break;
+    }
 
     return 0;
 }
 
 // Check if subtitle has events that would cause it to be animated inside {}
-static bool is_animated(char *s)
+static bool is_animated(const char *str)
 {
-    bool in_tag = false;
-    bool valid_event = false;
-    bool valid_tag = false;
-    while (*s) {
-        if (!in_tag && s[0] == '{')
-            in_tag = true;
-        if (s[0] == '\\') {
-            s++;
-            if (!s[0])
-                break;
-            if (s[0] == 'k' || s[0] == 'K' || s[0] == 't') {
-                valid_event = true;
-                continue;
-            // just bruteforce the multi-letter ones
-            } else if (s[0] == 'f') {
-                if (!strncmp(s, "fad", 3)) {
-                    valid_event = true;
-                    continue;
-                }
-            } else if (s[0] == 'm') {
-                if (!strncmp(s, "move", 4)) {
-                    valid_event = true;
-                    continue;
-                }
+    const char *begin = str;
+    while ((str = strchr(str, '{'))) {
+        if (str++ > begin && str[-2] == '\\')
+            continue;
+
+        const char *end = strchr(str, '}');
+        if (!end)
+            return false;
+
+        while ((str = memchr(str, '\\', end - str))) {
+            while (str[0] == '\\')
+                ++str;
+            while (str[0] == ' ' || str[0] == '\t')
+                ++str;
+            if (str[0] == 'k' || str[0] == 'K' || str[0] == 't' ||
+                (str[0] == 'f' && str[1] == 'a' && str[2] == 'd') ||
+                (str[0] == 'm' && str[1] == 'o' && str[2] == 'v' && str[3] == 'e'))
+            {
+                return true;
             }
         }
-        if (in_tag && valid_event && s[0] == '}') {
-            valid_tag = true;
-            break;
-        } else if (s[0] == '}') {
-            in_tag = false;
-            valid_event = false;
-            valid_tag = false;
-        }
-        s++;
+
+        str = end + 1;
     }
-    return valid_tag;
+
+    return false;
 }
 
 // Note: pkt is not necessarily a fully valid refcounted packet.
@@ -348,46 +385,72 @@ static void filter_and_add(struct sd *sd, struct demux_packet *pkt)
     }
 
     ass_process_chunk(ctx->ass_track, pkt->buffer, pkt->len,
-                      llrint(pkt->pts * 1000),
-                      llrint(pkt->duration * 1000));
+                      floor(pkt->pts * 1000 + 1e-6),
+                      floor(pkt->duration * 1000 + 1e-6));
+    if (pkt != orig_pkt)
+        talloc_free(pkt);
+    // the seen and animated state is kept on the original packet
+    pkt = orig_pkt;
 
-    // This bookkeeping is only ever needed for ASS subs
+    // This bookkeeping only has any practical use for ASS subs
+    // over a VO with no video.
     if (!ctx->is_converted) {
         if (!pkt->seen) {
             for (int n = track->n_events - 1; n >= 0; n--) {
-                if (n + 1 == old_n_events || pkt->animated)
+                if (n + 1 == old_n_events || pkt->animated == 1)
                     break;
                 ASS_Event *event = &track->events[n];
-                pkt->animated = (event->Effect && event->Effect[0]) ||
-                                 is_animated(event->Text);
+                // Might as well mark pkt->animated here with effects if we can.
+                pkt->animated = (event->Effect && event->Effect[0]) ? 1 : -1;
+                if (ctx->check_animated && pkt->animated != 1)
+                    pkt->animated = is_animated(event->Text);
             }
-            MP_TARRAY_APPEND(ctx, ctx->packets_animated, ctx->num_packets_animated, pkt->animated);
+            ctx->seen_packets[pkt->seen_pos].animated = pkt->animated;
         } else {
-            pkt->animated = ctx->packets_animated[pkt->seen_pos];
+            if (ctx->check_animated && ctx->seen_packets[pkt->seen_pos].animated == -1) {
+                for (int n = track->n_events - 1; n >= 0; n--) {
+                    if (n + 1 == old_n_events || pkt->animated == 1)
+                        break;
+                    ASS_Event *event = &track->events[n];
+                    ctx->seen_packets[pkt->seen_pos].animated = is_animated(event->Text);
+                    pkt->animated = ctx->seen_packets[pkt->seen_pos].animated;
+                }
+            } else {
+                pkt->animated = ctx->seen_packets[pkt->seen_pos].animated;
+            }
         }
     }
+}
 
-    if (pkt != orig_pkt)
-        talloc_free(pkt);
+// 64-bit FNV-1a
+static inline uint64_t hash_data(const unsigned char *data, size_t len)
+{
+    uint64_t hash = 0xcbf29ce484222325; // offset basis
+    for (size_t n = 0; n < len; n++)
+        hash = (hash ^ data[n]) * 0x100000001b3; // FNV prime
+    return hash;
 }
 
 // Test if the packet with the given file position and pts was already consumed.
 // Return false if the packet is new (and add it to the internal list), and
-// return true if it was already seen.
+// return true if it was already seen. Packets without a file position are
+// identified by a hash of their contents instead.
 static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
 {
     struct sd_ass_priv *priv = sd->priv;
+    int64_t sig = packet->pos >= 0 ? packet->pos
+                                   : hash_data(packet->buffer, packet->len);
     int a = 0;
     int b = priv->num_seen_packets;
     while (a < b) {
         int mid = a + (b - a) / 2;
         struct seen_packet *seen_packet = &priv->seen_packets[mid];
-        if (packet->pos == seen_packet->pos && packet->pts == seen_packet->pts) {
+        if (sig == seen_packet->sig && packet->pts == seen_packet->pts) {
             packet->seen_pos = mid;
             return true;
         }
-        if (packet->pos > seen_packet->pos ||
-            (packet->pos == seen_packet->pos && packet->pts > seen_packet->pts)) {
+        if (sig > seen_packet->sig ||
+            (sig == seen_packet->sig && packet->pts > seen_packet->pts)) {
             a = mid + 1;
         } else {
             b = mid;
@@ -395,7 +458,7 @@ static bool check_packet_seen(struct sd *sd, struct demux_packet *packet)
     }
     packet->seen_pos = a;
     MP_TARRAY_INSERT_AT(priv, priv->seen_packets, priv->num_seen_packets, a,
-                        (struct seen_packet){packet->pos, packet->pts});
+                        (struct seen_packet){sig, packet->pts, -1});
     return false;
 }
 
@@ -409,8 +472,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
     packet->sub_duration = packet->duration;
 
     if (ctx->converter) {
-        if (!sd->opts->sub_clear_on_seek && packet->pos >= 0 &&
-            check_packet_seen(sd, packet))
+        if (!sd->opts->sub_clear_on_seek && check_packet_seen(sd, packet))
             return;
 
         double sub_pts = 0;
@@ -419,10 +481,7 @@ static void decode(struct sd *sd, struct demux_packet *packet)
                                     &sub_duration);
         if (sd->opts->sub_stretch_durations ||
             packet->duration < 0 || sub_duration == UINT32_MAX) {
-            if (!ctx->duration_unknown) {
-                MP_WARN(sd, "Subtitle with unknown duration.\n");
-                ctx->duration_unknown = true;
-            }
+            MP_VERBOSE(sd, "Subtitle with unknown duration.\n");
             sub_duration = UNKNOWN_DURATION;
         }
 
@@ -435,17 +494,19 @@ static void decode(struct sd *sd, struct demux_packet *packet)
             };
             filter_and_add(sd, &pkt2);
         }
-        if (ctx->duration_unknown) {
-            for (int n = track->n_events - 2; n >= 0; n--) {
-                if (track->events[n].Duration == UNKNOWN_DURATION * 1000) {
-                    if (track->events[n].Start != track->events[n + 1].Start) {
-                        track->events[n].Duration = track->events[n + 1].Start -
-                                                    track->events[n].Start;
-                    } else {
-                        track->events[n].Duration = track->events[n + 1].Duration;
-                    }
+        for (int n = track->n_events - 1; n >= 0; n--) {
+            if (track->events[track->n_events - 1].Start == track->events[n].Start)
+                continue;
+            if (track->events[n].Duration == UNKNOWN_DURATION * 1000) {
+                if (track->events[n].Start < track->events[n + 1].Start) {
+                    track->events[n].Duration = track->events[n + 1].Start -
+                                                track->events[n].Start;
+                } else if (track->events[n].Start == track->events[n + 1].Start) {
+                    track->events[n].Duration = track->events[n + 1].Duration;
                 }
             }
+            if (n > 0 && track->events[n].Start != track->events[n - 1].Start)
+                break;
         }
     } else {
         // Note that for this packet format, libass has an internal mechanism
@@ -454,6 +515,21 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         packet->seen = check_packet_seen(sd, packet);
         filter_and_add(sd, packet);
     }
+}
+
+// Calculate the height used for scaling subtitle text size so --sub-scale-with-window
+// can undo this scale and use frame size instead. The algorithm used is the following:
+// - If use_margins is disabled, the text is scaled with the visual size of the video.
+// - If use_margins is enabled, the text is scaled with the size of the video
+//   as if the video is resized to "fit" the size of the frame.
+static float get_libass_scale_height(struct mp_osd_res *dim, bool use_margins)
+{
+    float vidw = dim->w - (dim->ml + dim->mr);
+    float vidh = dim->h - (dim->mt + dim->mb);
+    if (!use_margins || vidw < 1.0)
+        return vidh;
+    else
+        return MPMIN(dim->h, dim->w / vidw * vidh);
 }
 
 static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
@@ -475,8 +551,9 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
     bool set_scale_with_window = false;
     bool set_scale_by_window = true;
     bool total_override = false;
+
     // With forced overrides, apply the --sub-* specific options
-    if (converted || shared_opts->ass_style_override[sd->order] == 3) { // 'force'
+    if (converted || shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_FORCE) {
         set_scale_with_window = opts->sub_scale_with_window;
         set_use_margins = opts->sub_use_margins;
         set_scale_by_window = opts->sub_scale_by_window;
@@ -487,13 +564,14 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
     }
     if (converted || shared_opts->ass_style_override[sd->order]) {
         set_sub_pos = 100.0f - shared_opts->sub_pos[sd->order];
-        set_line_spacing = opts->ass_line_spacing;
-        set_hinting = opts->ass_hinting;
-        set_font_scale = opts->sub_scale;
+        set_line_spacing = opts->sub_line_spacing;
+        set_hinting = opts->sub_hinting;
+    }
+    if (total_override || shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE) {
+        set_font_scale = shared_opts->sub_scale[sd->order];
     }
     if (set_scale_with_window) {
-        int vidh = dim->h - (dim->mt + dim->mb);
-        set_font_scale *= dim->h / (float)MPMAX(vidh, 1);
+        set_font_scale *= dim->h / MPMAX(get_libass_scale_height(dim, set_use_margins), 1);
     }
     if (!set_scale_by_window) {
         double factor = dim->h / 720.0;
@@ -502,11 +580,21 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
     }
     ass_set_use_margins(priv, set_use_margins);
     ass_set_line_position(priv, set_sub_pos);
-    ass_set_shaper(priv, opts->ass_shaper);
+    ass_set_shaper(priv, opts->sub_shaper);
     int set_force_flags = 0;
-    if (total_override)
-        set_force_flags |= ASS_OVERRIDE_BIT_STYLE | ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;
-    if (shared_opts->ass_style_override[sd->order] == 4) // 'scale'
+    if (total_override) {
+        set_force_flags |= ASS_OVERRIDE_BIT_FONT_NAME
+                            | ASS_OVERRIDE_BIT_FONT_SIZE_FIELDS
+                            | ASS_OVERRIDE_BIT_COLORS
+                            | ASS_OVERRIDE_BIT_BORDER;
+        if (!opts->sub_scale_signs)
+            set_force_flags |= ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;
+#if LIBASS_VERSION >= 0x01703020
+        set_force_flags |= ASS_OVERRIDE_BIT_BLUR;
+#endif
+    }
+    if (shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_SCALE &&
+        !opts->sub_scale_signs)
         set_force_flags |= ASS_OVERRIDE_BIT_SELECTIVE_FONT_SCALE;
     if (converted)
         set_force_flags |= ASS_OVERRIDE_BIT_ALIGNMENT;
@@ -558,12 +646,14 @@ static void configure_ass(struct sd *sd, struct mp_osd_res *dim,
         if (override_playres) {
             int vidw = dim->w - (dim->ml + dim->mr);
             int vidh = dim->h - (dim->mt + dim->mb);
-            int old_playresx = track->PlayResX;
             track->PlayResX = track->PlayResY * (double)vidw / MPMAX(vidh, 1);
-            double fix_margins = track->PlayResX / (double)old_playresx;
+            // ffmpeg and mpv use a default PlayResX of 384 when it is not known,
+            // this comes from VSFilter.
+            double fix_margins = track->PlayResX / (double)MP_ASS_FONT_PLAYRESX;
             for (int n = 0; n < track->n_styles; n++) {
-                track->styles[n].MarginL = round(track->styles[n].MarginL * fix_margins);
-                track->styles[n].MarginR = round(track->styles[n].MarginR * fix_margins);
+                track->styles[n].MarginL = lrint(track->styles[n].MarginL * fix_margins);
+                track->styles[n].MarginR = lrint(track->styles[n].MarginR * fix_margins);
+                track->styles[n].MarginV = lrint(track->styles[n].MarginV * set_font_scale);
             }
         }
     }
@@ -585,15 +675,16 @@ static long long find_timestamp(struct sd *sd, double pts)
     if (pts == MP_NOPTS_VALUE)
         return 0;
 
-    long long ts = llrint(pts * 1000);
+    long long ts = floor(pts * 1000 + 1e-6);
 
-    if (!sd->opts->sub_fix_timing || sd->shared_opts->ass_style_override[sd->order] == 0)
+    if (!sd->opts->sub_fix_timing ||
+        sd->shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_NONE)
         return ts;
 
     // Try to fix small gaps and overlaps.
     ASS_Track *track = priv->ass_track;
-    int threshold = SUB_GAP_THRESHOLD * 1000;
-    int keep = SUB_GAP_KEEP * 1000;
+    int threshold = sd->opts->sub_fix_timing_threshold;
+    int keep = sd->opts->sub_fix_timing_keep;
 
     // Find the "current" event.
     ASS_Event *ev[2] = {0};
@@ -650,7 +741,8 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     struct sd_ass_priv *ctx = sd->priv;
     struct mp_subtitle_opts *opts = sd->opts;
     struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
-    bool no_ass = !opts->ass_enabled || shared_opts->ass_style_override[sd->order] == 5;
+    bool no_ass = !opts->ass_enabled ||
+        shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_STRIP;
     bool converted = (ctx->is_converted && !lavc_conv_is_styled(ctx->converter)) || no_ass;
     ASS_Track *track = no_ass ? ctx->shadow_track : ctx->ass_track;
     ASS_Renderer *renderer = ctx->ass_renderer;
@@ -671,10 +763,12 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 
     double scale = dim.display_par;
     if (!converted && (!shared_opts->ass_style_override[sd->order] ||
-                       opts->ass_vsfilter_aspect_compat))
+                       opts->ass_use_video_data >= 1))
     {
-        // Let's use the original video PAR for vsfilter compatibility:
-        double par = ctx->video_params.p_w / (double)ctx->video_params.p_h;
+        // Let's factor in video PAR for vsfilter compatibility:
+        double par = opts->ass_video_aspect > 0 ?
+                opts->ass_video_aspect :
+                ctx->video_params.p_w / (double)ctx->video_params.p_h;
         if (isnormal(par))
             scale *= par;
     }
@@ -684,7 +778,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
     }
     ass_set_pixel_aspect(renderer, scale);
     if (!converted && (!shared_opts->ass_style_override[sd->order] ||
-                       opts->ass_vsfilter_blur_compat))
+                       opts->ass_use_video_data >= 2))
     {
         ass_set_storage_size(renderer, ctx->video_params.w, ctx->video_params.h);
     } else {
@@ -697,7 +791,7 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
 
     int changed;
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
-    mp_ass_packer_pack(ctx->packer, &imgs, 1, changed, !converted, format, res);
+    mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
 
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
@@ -934,13 +1028,51 @@ static void uninit(struct sd *sd)
     talloc_free(ctx->copy_cache);
 }
 
+static struct sub_lines *get_lines(struct sd *sd)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    ASS_Track *track = ctx->ass_track;
+    struct sub_lines *res = talloc_zero(NULL, struct sub_lines);
+
+    for (int i = 0; i < track->n_events; i++) {
+        ASS_Event *event = &track->events[i];
+        if (!event->Text)
+            continue;
+
+        char *plain = NULL;
+        bstr result = sd_ass_to_plaintext(&plain, event->Text);
+
+        // ASS subtitle lines can have many empty lines after stripping tags,
+        // but empty lines are useful in LRC.
+        if (is_whitespace_only(result)) {
+            talloc_free(plain);
+            if (!strcmp(sd->codec->codec, "ass"))
+                continue;
+            plain = talloc_strdup(res, "");
+        } else {
+            talloc_steal(res, plain);
+        }
+
+        struct sub_line line = {
+            .text  = plain,
+            .start = event->Start / 1000.0,
+            .end   = event->Duration == UNKNOWN_DURATION * 1000
+                         ? MP_NOPTS_VALUE
+                         : (event->Start + event->Duration) / 1000.0,
+        };
+        MP_TARRAY_APPEND(res, res->entries, res->num_entries, line);
+    }
+
+    return res;
+}
+
 static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
 {
     struct sd_ass_priv *ctx = sd->priv;
     switch (cmd) {
     case SD_CTRL_SUB_STEP: {
         double *a = arg;
-        long long ts = llrint(a[0] * 1000.0);
+        long long ts = floor(a[0] * 1000.0 + 1e-6);
         long long res = ass_step_sub(ctx->ass_track, ts, a[1]);
         if (!res)
             return false;
@@ -948,11 +1080,18 @@ static int control(struct sd *sd, enum sd_ctrl cmd, void *arg)
         a[0] += res / 1000.0 + SUB_SEEK_OFFSET;
         return true;
     }
+    case SD_CTRL_SET_ANIMATED_CHECK:
+        ctx->check_animated = *(bool *)arg;
+        return CONTROL_OK;
+    case SD_CTRL_RESET_SOFT:
+        ctx->clear_once = true;
+        reset(sd);
+        return CONTROL_OK;
     case SD_CTRL_SET_VIDEO_PARAMS:
         ctx->video_params = *(struct mp_image_params *)arg;
         return CONTROL_OK;
     case SD_CTRL_UPDATE_OPTS: {
-        int flags = (uintptr_t)arg;
+        uint64_t flags = *(uint64_t *)arg;
         if (flags & UPDATE_SUB_FILT) {
             filters_destroy(sd);
             filters_init(sd);
@@ -982,6 +1121,7 @@ const struct sd_functions sd_ass = {
     .get_bitmaps = get_bitmaps,
     .get_text = get_text,
     .get_times = get_times,
+    .get_lines = get_lines,
     .control = control,
     .reset = reset,
     .select = enable_output,
@@ -1021,9 +1161,9 @@ static void mangle_colors(struct sd *sd, struct sub_bitmaps *parts)
     // NONE is a bit random, but the intention is: don't modify colors.
     if (trackcsp == YCBCR_NONE)
         return;
-    if (trackcsp < sizeof(ass_csp) / sizeof(ass_csp[0]))
+    if (trackcsp < MP_ARRAY_SIZE(ass_csp))
         csp = ass_csp[trackcsp];
-    if (trackcsp < sizeof(ass_levels) / sizeof(ass_levels[0]))
+    if (trackcsp <  MP_ARRAY_SIZE(ass_levels))
         levels = ass_levels[trackcsp];
     if (trackcsp == YCBCR_DEFAULT) {
         csp = PL_COLOR_SYSTEM_BT_601;

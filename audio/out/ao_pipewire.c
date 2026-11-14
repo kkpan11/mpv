@@ -20,6 +20,14 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+// For FreeBSD where spa/param/audio/raw.h expects those to be defined
+#include "osdep/endian.h"
+#ifndef __BYTE_ORDER
+#define __BYTE_ORDER    BYTE_ORDER
+#define __LITTLE_ENDIAN LITTLE_ENDIAN
+#define __BIG_ENDIAN    BIG_ENDIAN
+#endif
+
 #include <pipewire/pipewire.h>
 #include <pipewire/global.h>
 #include <spa/param/audio/format-utils.h>
@@ -36,23 +44,12 @@
 #include "internal.h"
 #include "osdep/timer.h"
 
-#if !PW_CHECK_VERSION(0, 3, 50)
-static inline int pw_stream_get_time_n(struct pw_stream *stream, struct pw_time *time, size_t size) {
-	return pw_stream_get_time(stream, time);
-}
-#endif
-
-#if !PW_CHECK_VERSION(0, 3, 57)
-// Earlier versions segfault on zeroed hooks
-#define spa_hook_remove(hook) if ((hook)->link.prev) spa_hook_remove(hook)
-#endif
-
 #if !PW_CHECK_VERSION(1, 0, 4)
 static uint64_t pw_stream_get_nsec(struct pw_stream *stream)
 {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return SPA_TIMESPEC_TO_NSEC(&ts);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return SPA_TIMESPEC_TO_NSEC(&ts);
 }
 #endif
 
@@ -150,10 +147,10 @@ static enum spa_audio_channel mp_speaker_id_to_spa(struct ao *ao, enum mp_speake
     case MP_SPEAKER_ID_TBR:  return SPA_AUDIO_CHANNEL_TRR;
     case MP_SPEAKER_ID_DL:   return SPA_AUDIO_CHANNEL_FL;
     case MP_SPEAKER_ID_DR:   return SPA_AUDIO_CHANNEL_FR;
-    case MP_SPEAKER_ID_WL:   return SPA_AUDIO_CHANNEL_FL;
-    case MP_SPEAKER_ID_WR:   return SPA_AUDIO_CHANNEL_FR;
+    case MP_SPEAKER_ID_WL:   return SPA_AUDIO_CHANNEL_FLW;
+    case MP_SPEAKER_ID_WR:   return SPA_AUDIO_CHANNEL_FRW;
     case MP_SPEAKER_ID_SDL:  return SPA_AUDIO_CHANNEL_SL;
-    case MP_SPEAKER_ID_SDR:  return SPA_AUDIO_CHANNEL_SL;
+    case MP_SPEAKER_ID_SDR:  return SPA_AUDIO_CHANNEL_SR;
     case MP_SPEAKER_ID_LFE2: return SPA_AUDIO_CHANNEL_LFE2;
     case MP_SPEAKER_ID_TSL:  return SPA_AUDIO_CHANNEL_TSL;
     case MP_SPEAKER_ID_TSR:  return SPA_AUDIO_CHANNEL_TSR;
@@ -183,10 +180,8 @@ static void on_process(void *userdata)
     struct spa_buffer *buf = b->buffer;
 
     int nframes = buf->datas[0].maxsize / ao->sstride;
-#if PW_CHECK_VERSION(0, 3, 49)
     if (b->requested != 0)
         nframes = MPMIN(b->requested, nframes);
-#endif
 
     for (int i = 0; i < buf->n_datas; i++)
         data[i] = buf->datas[i].data;
@@ -200,13 +195,11 @@ static void on_process(void *userdata)
     int64_t end_time = mp_time_ns();
     end_time += MP_TIME_S_TO_NS(nframes) / ao->samplerate;
     end_time += MP_TIME_S_TO_NS(time.delay) * time.rate.num / time.rate.denom;
-    end_time += MP_TIME_S_TO_NS(time.queued) / ao->samplerate;
-#if PW_CHECK_VERSION(0, 3, 50)
+    end_time += MP_TIME_S_TO_NS(time.queued / ao->sstride) / ao->samplerate;
     end_time += MP_TIME_S_TO_NS(time.buffered) / ao->samplerate;
-#endif
     end_time -= pw_stream_get_nsec(p->stream) - time.now;
 
-    int samples = ao_read_data_nonblocking(ao, data, nframes, end_time);
+    int samples = ao_read_data(ao, data, nframes, end_time, NULL, false, false);
     b->size = samples;
 
     for (int i = 0; i < buf->n_datas; i++) {
@@ -512,15 +505,11 @@ static int pipewire_init_boilerplate(struct ao *ao)
     if (p->loop == NULL)
         return -1;
 
-    pw_thread_loop_lock(p->loop);
-
-    if (pw_thread_loop_start(p->loop) < 0)
-        goto error;
-
-    context = pw_context_new(
-            pw_thread_loop_get_loop(p->loop),
-            pw_properties_new(PW_KEY_CONFIG_NAME, "client-rt.conf", NULL),
-            0);
+    struct pw_properties *props = NULL;
+#if !PW_CHECK_VERSION(1, 3, 81)
+    props = pw_properties_new(PW_KEY_CONFIG_NAME, "client-rt.conf", NULL);
+#endif
+    context = pw_context_new(pw_thread_loop_get_loop(p->loop), props, 0);
     if (!context)
         goto error;
 
@@ -531,7 +520,7 @@ static int pipewire_init_boilerplate(struct ao *ao)
     if (!p->core) {
         MP_MSG(ao, ao->probing ? MSGL_V : MSGL_ERR,
                "Could not connect to context '%s': %s\n",
-               p->options.remote, mp_strerror(errno));
+               p->options.remote ? p->options.remote : "(default)", mp_strerror(errno));
         pw_context_destroy(context);
         goto error;
     }
@@ -539,7 +528,8 @@ static int pipewire_init_boilerplate(struct ao *ao)
     if (pw_core_add_listener(p->core, &p->core_listener, &core_events, ao) < 0)
         goto error;
 
-    pw_thread_loop_unlock(p->loop);
+    if (pw_thread_loop_start(p->loop) < 0)
+        goto error;
 
     if (!session_has_sinks(ao)) {
         MP_VERBOSE(ao, "PipeWire does not have any audio sinks, skipping\n");
@@ -549,7 +539,6 @@ static int pipewire_init_boilerplate(struct ao *ao)
     return 0;
 
 error:
-    pw_thread_loop_unlock(p->loop);
     return -1;
 }
 
@@ -583,16 +572,18 @@ static int init(struct ao *ao)
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio",
         PW_KEY_MEDIA_CATEGORY, "Playback",
-        PW_KEY_MEDIA_ROLE, ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC ?  "Music" : "Movie",
         PW_KEY_NODE_NAME, ao->client_name,
         PW_KEY_NODE_DESCRIPTION, ao->client_name,
         PW_KEY_APP_NAME, ao->client_name,
         PW_KEY_APP_ID, ao->client_name,
         PW_KEY_APP_ICON_NAME, ao->client_name,
-        PW_KEY_NODE_ALWAYS_PROCESS, "true",
         PW_KEY_TARGET_OBJECT, ao->device,
         NULL
     );
+
+    if (ao->set_media_role)
+        pw_properties_set(props, PW_KEY_MEDIA_ROLE,
+                          ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC ? "Music" : "Movie");
 
     if (pipewire_init_boilerplate(ao) < 0)
         goto error_props;
@@ -633,8 +624,11 @@ static int init(struct ao *ao)
             .channels = ao->channels.num,
         };
 
-        for (int i = 0; i < ao->channels.num; i++)
-            audio_info.position[i] = mp_speaker_id_to_spa(ao, ao->channels.speaker[i]);
+        bool unknown = mp_chmap_is_unknown(&ao->channels);
+        for (int i = 0; i < ao->channels.num; i++) {
+            audio_info.position[i] = unknown ? SPA_AUDIO_CHANNEL_AUX0 + i
+                                             : mp_speaker_id_to_spa(ao, ao->channels.speaker[i]);
+        }
 
         params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &audio_info);
         if (!params[0])
@@ -677,7 +671,7 @@ static int init(struct ao *ao)
 
     pw_thread_loop_unlock(p->loop);
 
-    if (p->init_state == INIT_STATE_ERROR)
+    if (p->init_state != INIT_STATE_SUCCESS)
         goto error;
 
     return 0;
@@ -890,7 +884,7 @@ static void hotplug_uninit(struct ao *ao)
 
 static void list_devs(struct ao *ao, struct ao_device_list *list)
 {
-    ao_device_list_add(list, ao, &(struct ao_device_desc){});
+    ao_device_list_add(list, ao, &(struct ao_device_desc){0});
 
     if (for_each_sink(ao, add_device_to_list, list) < 0)
         MP_WARN(ao, "Could not list devices, list may be incomplete\n");

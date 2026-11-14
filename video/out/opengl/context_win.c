@@ -292,7 +292,7 @@ static bool wgl_init(struct ra_ctx *ctx)
     p->opts = p->opts_cache->opts;
 
     if (!vo_w32_init(ctx->vo))
-        goto fail;
+        return false;
 
     if (ctx->opts.want_alpha)
         vo_w32_set_transparency(ctx->vo, ctx->opts.want_alpha);
@@ -312,7 +312,7 @@ static bool wgl_init(struct ra_ctx *ctx)
     gl->SwapInterval = wgl_swap_interval;
     p->current_swapinterval = -1;
 
-    struct ra_gl_ctx_params params = {
+    struct ra_ctx_params params = {
         .swap_buffers = wgl_swap_buffers,
     };
 

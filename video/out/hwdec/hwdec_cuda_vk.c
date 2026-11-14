@@ -24,7 +24,8 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libplacebo/vulkan.h>
-#include <unistd.h>
+
+#include "osdep/io.h"
 
 #if HAVE_WIN32_DESKTOP
 #include <versionhelpers.h>
@@ -54,8 +55,13 @@ static bool cuda_ext_vk_init(struct ra_hwdec_mapper *mapper,
     int mem_fd = -1;
     int ret = 0;
 
-    struct ext_vk *evk = talloc_ptrtype(NULL, evk);
+    struct ext_vk *evk = talloc_zero_ptrtype(NULL, evk);
     p->ext[n] = evk;
+
+#if !HAVE_WIN32_DESKTOP
+    // need to initialise fd as invalid; zero alloc covers the Win32 .handle
+    evk->sem_handle.fd = -1;
+#endif
 
     pl_gpu gpu = ra_pl_get(mapper->ra);
 
@@ -83,7 +89,7 @@ static bool cuda_ext_vk_init(struct ra_hwdec_mapper *mapper,
     mapper->tex[n] = ratex;
 
 #if !HAVE_WIN32_DESKTOP
-    mem_fd = dup(evk->pltex->shared_mem.handle.fd);
+    mem_fd = mp_dup_cloexec(evk->pltex->shared_mem.handle.fd);
     if (mem_fd < 0)
         goto error;
 #endif
@@ -147,8 +153,8 @@ static bool cuda_ext_vk_init(struct ra_hwdec_mapper *mapper,
     if (evk->vk_sem.sem == VK_NULL_HANDLE) {
          ret = -1;
          goto error;
-     }
-     // The returned FD or Handle is owned by the caller (us).
+    }
+    // The returned FD or Handle is owned by the caller (us).
 
     CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC w_desc = {
 #if HAVE_WIN32_DESKTOP
@@ -162,8 +168,10 @@ static bool cuda_ext_vk_init(struct ra_hwdec_mapper *mapper,
     ret = CHECK_CU(cu->cuImportExternalSemaphore(&evk->cuda_sem, &w_desc));
     if (ret < 0)
         goto error;
+#if !HAVE_WIN32_DESKTOP
     // CUDA takes ownership of an imported FD *but not* an imported Handle.
     evk->sem_handle.fd = -1;
+#endif
 
     return true;
 
@@ -233,8 +241,8 @@ static bool cuda_ext_vk_wait(const struct ra_hwdec_mapper *mapper, int n)
                 .value = evk->vk_sem.value
             }
         }
-     };
-     ret = CHECK_CU(cu->cuWaitExternalSemaphoresAsync(&evk->cuda_sem,
+    };
+    ret = CHECK_CU(cu->cuWaitExternalSemaphoresAsync(&evk->cuda_sem,
                                                      &wp, 1, 0));
     return ret == 0;
 }
@@ -272,27 +280,30 @@ static bool cuda_ext_vk_signal(const struct ra_hwdec_mapper *mapper, int n)
 #undef CHECK_CU
 #define CHECK_CU(x) check_cu(hw, (x), #x)
 
-bool cuda_vk_init(const struct ra_hwdec *hw) {
+static bool cuda_vk_check(const struct ra_hwdec *hw) {
+    pl_gpu gpu = ra_pl_get(hw->ra_ctx->ra);
+    if (gpu == NULL)
+        return false; // This is not a Vulkan RA.
+
+    if (!(gpu->export_caps.tex & HANDLE_TYPE)) {
+        MP_VERBOSE(hw, "CUDA hwdec with Vulkan requires exportable texture memory of type 0x%X.\n",
+                   HANDLE_TYPE);
+        return false;
+    } else if (!(gpu->export_caps.sync & HANDLE_TYPE)) {
+        MP_VERBOSE(hw, "CUDA hwdec with Vulkan requires exportable semaphores of type 0x%X.\n",
+                   HANDLE_TYPE);
+        return false;
+    }
+
+    return true;
+}
+
+static bool cuda_vk_init(const struct ra_hwdec *hw) {
     int ret = 0;
     int level = hw->probing ? MSGL_V : MSGL_ERR;
     struct cuda_hw_priv *p = hw->priv;
     CudaFunctions *cu = p->cu;
-
     pl_gpu gpu = ra_pl_get(hw->ra_ctx->ra);
-    if (gpu != NULL) {
-        if (!(gpu->export_caps.tex & HANDLE_TYPE)) {
-            MP_VERBOSE(hw, "CUDA hwdec with Vulkan requires exportable texture memory of type 0x%X.\n",
-                       HANDLE_TYPE);
-            return false;
-        } else if (!(gpu->export_caps.sync & HANDLE_TYPE)) {
-            MP_VERBOSE(hw, "CUDA hwdec with Vulkan requires exportable semaphores of type 0x%X.\n",
-                       HANDLE_TYPE);
-            return false;
-        }
-    } else {
-        // This is not a Vulkan RA.
-        return false;
-    }
 
     if (!cu->cuImportExternalMemory) {
         MP_MSG(hw, level, "CUDA hwdec with Vulkan requires driver version 410.48 or newer.\n");
@@ -342,3 +353,7 @@ bool cuda_vk_init(const struct ra_hwdec *hw) {
     return true;
 }
 
+struct cuda_interop_fn cuda_vk_fn = {
+    .check = cuda_vk_check,
+    .init = cuda_vk_init
+};

@@ -192,6 +192,11 @@ static int init(struct ao *ao)
         goto err_out;
     }
     ctx = alcCreateContext(dev, attribs);
+    if (!ctx) {
+        MP_FATAL(ao, "Failed to create OpenAL context\n");
+        alcCloseDevice(dev);
+        goto err_out;
+    }
     alcMakeContextCurrent(ctx);
     alListenerfv(AL_POSITION, position);
     alListenerfv(AL_ORIENTATION, direction);
@@ -255,7 +260,7 @@ static int init(struct ao *ao)
         MP_CHMAP4(FL, FR, BL, BR),                  // 4.0
         {0},                                        // 5.0
         MP_CHMAP6(FL, FR, FC, LFE, BL, BR),         // 5.1
-        MP_CHMAP7(FL, FR, FC, LFE, SL, SR, BC),     // 6.1
+        MP_CHMAP7(FL, FR, FC, LFE, BC, SL, SR),     // 6.1
         MP_CHMAP8(FL, FR, FC, LFE, BL, BR, SL, SR), // 7.1
     };
     ao->channels = possible_layouts[num_channels];

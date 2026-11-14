@@ -109,7 +109,7 @@ static const struct key_entry keys[] = {
     {"\033[B", MP_KEY_DOWN},
     {"\033[C", MP_KEY_RIGHT},
     {"\033[D", MP_KEY_LEFT},
-    {"\033[E", MP_KEY_KP5},
+    {"\033[E", MP_KEY_KPBEGIN},
     {"\033[F", MP_KEY_END},
     {"\033[H", MP_KEY_HOME},
 
@@ -130,11 +130,11 @@ static const struct key_entry keys[] = {
     {"\033Ob", MP_KEY_DOWN | MP_KEY_MODIFIER_CTRL},
     {"\033Oc", MP_KEY_RIGHT | MP_KEY_MODIFIER_CTRL},
     {"\033Od", MP_KEY_LEFT | MP_KEY_MODIFIER_CTRL},
-    {"\033Oj", '*'}, // also keypad, but we don't have separate codes for them
-    {"\033Ok", '+'},
-    {"\033Om", '-'},
+    {"\033Oj", MP_KEY_KPMULTIPLY},
+    {"\033Ok", MP_KEY_KPADD},
+    {"\033Om", MP_KEY_KPSUBTRACT},
     {"\033On", MP_KEY_KPDEC},
-    {"\033Oo", '/'},
+    {"\033Oo", MP_KEY_KPDIVIDE},
     {"\033Op", MP_KEY_KP0},
     {"\033Oq", MP_KEY_KP1},
     {"\033Or", MP_KEY_KP2},
@@ -195,7 +195,7 @@ struct termbuf {
 
 static void skip_buf(struct termbuf *b, unsigned int count)
 {
-    assert(count <= b->len);
+    mp_assert(count <= b->len);
 
     memmove(&b->b[0], &b->b[count], b->len - count);
     b->len -= count;
@@ -285,7 +285,7 @@ static void process_input(struct input_ctx *input_ctx, bool timeout)
 
         if (match->replace) {
             int rep = strlen(match->replace);
-            assert(rep <= seq_len);
+            mp_assert(rep <= seq_len);
             memcpy(buf.b, match->replace, rep);
             memmove(buf.b + rep, buf.b + seq_len, buf.len - seq_len);
             buf.len = rep + buf.len - seq_len;
@@ -306,7 +306,7 @@ static void process_input(struct input_ctx *input_ctx, bool timeout)
             terminal_get_size2(&num_rows, &num_cols, &total_px_width, &total_px_height);
             mp_input_set_mouse_pos(input_ctx,
                 (buf.b[4] - 32.5) * (total_px_width / num_cols),
-                (buf.b[5] - 32.5) * (total_px_height / num_rows));
+                (buf.b[5] - 32.5) * (total_px_height / num_rows), false);
         }
         if (match->type != ENTRY_TYPE_MOUSE_MOVE)
             mp_input_put_key(input_ctx, buf.mods | match->mpkey);
@@ -362,9 +362,12 @@ static void do_deactivate_getch2(void)
     getch2_active = 0;
 }
 
+static struct sigaction old_sigcont, old_sigtstp, old_sigwinch, old_sigttin,
+                        old_sigttou, old_sigint, old_sigquit, old_sigterm;
+
 // sigaction wrapper
 static int setsigaction(int signo, void (*handler) (int),
-                        int flags, bool do_mask)
+                        int flags, bool do_mask, struct sigaction *old)
 {
     struct sigaction sa;
     sa.sa_handler = handler;
@@ -375,7 +378,7 @@ static int setsigaction(int signo, void (*handler) (int),
         sigemptyset(&sa.sa_mask);
 
     sa.sa_flags = flags | SA_RESTART;
-    return sigaction(signo, &sa, NULL);
+    return sigaction(signo, &sa, old);
 }
 
 static void getch2_poll(void)
@@ -396,7 +399,7 @@ static void getch2_poll(void)
 static mp_thread input_thread;
 static struct input_ctx *input_ctx;
 static int death_pipe[2] = {-1, -1};
-enum { PIPE_STOP, PIPE_CONT };
+enum { PIPE_STOP, PIPE_CONT, PIPE_WINCH };
 static int stop_cont_pipe[2] = {-1, -1};
 
 static void stop_cont_sighandler(int signum)
@@ -405,6 +408,34 @@ static void stop_cont_sighandler(int signum)
     char sig = signum == SIGCONT ? PIPE_CONT : PIPE_STOP;
     (void)write(stop_cont_pipe[1], &sig, 1);
     errno = saved_errno;
+}
+
+static void winch_sighandler(int signum)
+{
+    int saved_errno = errno;
+    (void)write(stop_cont_pipe[1], &(char){PIPE_WINCH}, 1);
+    errno = saved_errno;
+}
+
+static mp_static_mutex resize_lock = MP_STATIC_MUTEX_INITIALIZER;
+static void (*resize_cb)(void *ctx);
+static void *resize_ctx;
+
+bool terminal_set_resize_callback(void (*cb)(void *ctx), void *ctx)
+{
+    mp_mutex_lock(&resize_lock);
+    resize_cb = cb;
+    resize_ctx = ctx;
+    mp_mutex_unlock(&resize_lock);
+    return input_ctx != NULL;
+}
+
+static void notify_resize(void)
+{
+    mp_mutex_lock(&resize_lock);
+    if (resize_cb)
+        resize_cb(resize_ctx);
+    mp_mutex_unlock(&resize_lock);
 }
 
 static void safe_close(int *p)
@@ -480,6 +511,8 @@ static MP_THREAD_VOID terminal_thread(void *ptr)
                 raise(SIGSTOP);
             } else if (c == PIPE_CONT) {
                 getch2_poll();
+            } else if (c == PIPE_WINCH) {
+                notify_resize();
             }
         }
         if (fds[2].revents) {
@@ -527,9 +560,17 @@ void terminal_setup_getch(struct input_ctx *ictx)
         return;
     }
 
-    setsigaction(SIGINT,  quit_request_sighandler, SA_RESETHAND, false);
-    setsigaction(SIGQUIT, quit_request_sighandler, 0, true);
-    setsigaction(SIGTERM, quit_request_sighandler, 0, true);
+    setsigaction(SIGINT,  quit_request_sighandler, SA_RESETHAND, false, &old_sigint);
+    setsigaction(SIGQUIT, quit_request_sighandler, 0, true, &old_sigquit);
+    setsigaction(SIGTERM, quit_request_sighandler, 0, true, &old_sigterm);
+}
+
+static void restore_sigaction(int signo, void (*handler) (int),
+                              const struct sigaction *old)
+{
+    struct sigaction cur;
+    if (!sigaction(signo, NULL, &cur) && cur.sa_handler == handler)
+        sigaction(signo, old, NULL);
 }
 
 void terminal_uninit(void)
@@ -538,20 +579,24 @@ void terminal_uninit(void)
         return;
 
     // restore signals
-    setsigaction(SIGCONT, SIG_DFL, 0, false);
-    setsigaction(SIGTSTP, SIG_DFL, 0, false);
-    setsigaction(SIGINT,  SIG_DFL, 0, false);
-    setsigaction(SIGQUIT, SIG_DFL, 0, false);
-    setsigaction(SIGTERM, SIG_DFL, 0, false);
-    setsigaction(SIGTTIN, SIG_DFL, 0, false);
-    setsigaction(SIGTTOU, SIG_DFL, 0, false);
+    restore_sigaction(SIGCONT, stop_cont_sighandler, &old_sigcont);
+    restore_sigaction(SIGTSTP, stop_cont_sighandler, &old_sigtstp);
+    restore_sigaction(SIGWINCH, winch_sighandler, &old_sigwinch);
+    if (input_ctx) {
+        restore_sigaction(SIGINT, quit_request_sighandler, &old_sigint);
+        restore_sigaction(SIGQUIT, quit_request_sighandler, &old_sigquit);
+        restore_sigaction(SIGTERM, quit_request_sighandler, &old_sigterm);
+    }
+    restore_sigaction(SIGTTIN, SIG_IGN, &old_sigttin);
+    restore_sigaction(SIGTTOU, SIG_IGN, &old_sigttou);
 
     if (input_ctx) {
         (void)write(death_pipe[1], &(char){0}, 1);
         mp_thread_join(input_thread);
-        close_sig_pipes();
-        input_ctx = NULL;
     }
+
+    close_sig_pipes();
+    input_ctx = NULL;
 
     do_deactivate_getch2();
     close_tty();
@@ -594,9 +639,21 @@ void terminal_set_mouse_input(bool enable)
     fflush(stdout);
 }
 
+static mp_static_mutex output_lock = MP_STATIC_MUTEX_INITIALIZER;
+
+void terminal_lock_output(void)
+{
+    mp_mutex_lock(&output_lock);
+}
+
+void terminal_unlock_output(void)
+{
+    mp_mutex_unlock(&output_lock);
+}
+
 void terminal_init(void)
 {
-    assert(!getch2_enabled);
+    mp_assert(!getch2_enabled);
     getch2_enabled = 1;
 
     if (mp_make_wakeup_pipe(stop_cont_pipe) < 0) {
@@ -613,10 +670,11 @@ void terminal_init(void)
     tcgetattr(tty_in, &tio_orig);
 
     // handlers to fix terminal settings
-    setsigaction(SIGCONT, stop_cont_sighandler, 0, true);
-    setsigaction(SIGTSTP, stop_cont_sighandler, 0, true);
-    setsigaction(SIGTTIN, SIG_IGN, 0, true);
-    setsigaction(SIGTTOU, SIG_IGN, 0, true);
+    setsigaction(SIGCONT, stop_cont_sighandler, 0, true, &old_sigcont);
+    setsigaction(SIGTSTP, stop_cont_sighandler, 0, true, &old_sigtstp);
+    setsigaction(SIGWINCH, winch_sighandler, 0, true, &old_sigwinch);
+    setsigaction(SIGTTIN, SIG_IGN, 0, true, &old_sigttin);
+    setsigaction(SIGTTOU, SIG_IGN, 0, true, &old_sigttou);
 
     getch2_poll();
 }

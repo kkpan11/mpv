@@ -76,12 +76,19 @@ static char *mp_get_win_local_app_dir(void *talloc_ctx)
     return path ? mp_path_join(talloc_ctx, path, "mpv") : NULL;
 }
 
+static void path_uninit(void)
+{
+    TA_FREEP(&portable_path);
+}
+
 static void path_init(void)
 {
     void *tmp = talloc_new(NULL);
     char *path = mp_get_win_exe_subdir(tmp, "portable_config");
-    if (path && mp_path_exists(path))
+    if (path && mp_path_exists(path)) {
         portable_path = talloc_strdup(NULL, path);
+        atexit(path_uninit);
+    }
     talloc_free(tmp);
 }
 
@@ -100,12 +107,12 @@ const char *mp_get_platform_path_win(void *talloc_ctx, const char *type)
             return mp_path_join(talloc_ctx, mp_get_win_local_app_dir(talloc_ctx), "cache");
         if (strcmp(type, "state") == 0)
             return mp_get_win_local_app_dir(talloc_ctx);
-        if (strcmp(type, "exe_dir") == 0)
-            return mp_get_win_exe_dir(talloc_ctx);
         // Not really true, but serves as a way to return a lowest-priority dir.
         if (strcmp(type, "global") == 0)
             return mp_get_win_exe_subdir(talloc_ctx, "mpv");
     }
+    if (strcmp(type, "exe_dir") == 0)
+        return mp_get_win_exe_dir(talloc_ctx);
     if (strcmp(type, "desktop") == 0)
         return mp_get_win_shell_dir(talloc_ctx, &FOLDERID_Desktop);
     return NULL;

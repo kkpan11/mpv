@@ -195,7 +195,7 @@ mp.create_osd_overlay = function create_osd_overlay(format) {
                     cmd[k] = this[k];
             }
 
-            cmd.name = "osd-overlay";
+            cmd._name = "osd-overlay";
             cmd.res_x = Math.round(this.res_x);
             cmd.res_y = Math.round(this.res_y);
 
@@ -204,7 +204,7 @@ mp.create_osd_overlay = function create_osd_overlay(format) {
 
         remove: function ass_remove() {
             mp.command_native({
-                name: "osd-overlay",
+                _name: "osd-overlay",
                 id: this.id,
                 format: "none",
                 data: "",
@@ -246,10 +246,10 @@ mp.get_osd_margins = function get_osd_margins() {
 // {cb: fn, forced: bool, maybe input: str, repeatable: bool, complex: bool}
 var binds = new_cache();
 
-function dispatch_key_binding(name, state, key_name, key_text) {
+function dispatch_key_binding(name, state, key_name, key_text, scale, arg) {
     var cb = binds[name] ? binds[name].cb : false;
     if (cb)  // "script-binding [<script_name>/]<name>" command was invoked
-        cb(state, key_name, key_text);
+        cb(state, key_name, key_text, scale, arg);
 }
 
 var binds_tid = 0;  // flush timer id. actual id's are always true-thy
@@ -307,12 +307,15 @@ function add_binding(forced, key, name, fn, opts) {
             fn({event: "press", is_mouse: false});
         });
         var KEY_STATES = { u: "up", d: "down", r: "repeat", p: "press" };
-        key_data.cb = function key_cb(state, key_name, key_text) {
+        key_data.cb = function key_cb(state, key_name, key_text, scale, arg) {
             fn({
                 event: KEY_STATES[state[0]] || "unknown",
                 is_mouse: state[1] == "m",
+                canceled: state[2] == "c",
                 key_name: key_name || undefined,
-                key_text: key_text || undefined
+                key_text: key_text || undefined,
+                scale: scale ? parseFloat(scale) : 1.0,
+                arg: arg,
             });
         }
     } else {
@@ -321,14 +324,18 @@ function add_binding(forced, key, name, fn, opts) {
             // Emulate the semantics at input.c: mouse emits on up, kb on down.
             // Also, key repeat triggers the binding again.
             var e = state[0],
-                emit = (state[1] == "m") ? (e == "u") : (e == "d");
+                emit = (state[1] == "m") ? (e == "u") : (e == "d"),
+                canceled = state[2] == "c";
+            if (canceled)
+                return;
             if (emit || e == "p" || e == "r" && key_data.repeatable)
                 fn();
         }
     }
 
+    var prefix = key_data.scalable ? "" : " nonscalable";
     if (key)
-        key_data.input = key + " script-binding " + mp.script_name + "/" + name;
+        key_data.input = key + prefix + " script-binding " + mp.script_name + "/" + name;
     binds[name] = key_data;  // used by user and/or our (key) script-binding
     sched_bindings_flush();
 }
@@ -646,50 +653,94 @@ mp.options = { read_options: read_options };
 /**********************************************************************
 *  input
 *********************************************************************/
+var input_handle_counter = 0;
+var latest_handler_id;
+var latest_log_id;
+
+function register_event_handler(t) {
+    var handler_id = "input-event/" + input_handle_counter++;
+    latest_handler_id = handler_id;
+
+    mp.register_script_message(handler_id, function (event, args) {
+        if (event == "closed")
+            mp.unregister_script_message(handler_id);
+
+        if (!t[event] || (latest_handler_id !== handler_id && event !== "closed"))
+            return;
+
+        args = args ? JSON.parse(args) : [];
+
+        if (event == "complete") {
+            var complete = function(completions, completion_pos, completion_append) {
+                if (completions == undefined)
+                    return;
+
+                mp.commandv("script-message-to", "console", "complete", JSON.stringify({
+                                client_name: mp.script_name,
+                                handler_id: handler_id,
+                                original_line: args[0],
+                                list: completions,
+                                start_pos: completion_pos,
+                                append: completion_append || "",
+                            }));
+            }
+
+            args[1] = complete;
+            complete.apply(null, t[event].apply(null, args));
+        } else {
+            t[event].apply(null, args)
+        }
+    })
+
+    return handler_id;
+}
+
+function input_request(t) {
+    t.has_completions = t.complete !== undefined;
+    t.client_name = mp.script_name;
+    t.handler_id = register_event_handler(t);
+
+    mp.commandv("script-message-to", "console", "get-input", JSON.stringify(t));
+}
+
 mp.input = {
     get: function(t) {
-        mp.commandv("script-message-to", "console", "get-input", mp.script_name,
-                    JSON.stringify({
-                        prompt: t.prompt,
-                        default_text: t.default_text,
-                        cursor_position: t.cursor_position,
-                        id: t.id,
-                    }));
-
-        mp.register_script_message("input-event", function (type, text, cursor_position) {
-            if (t[type]) {
-                var result = t[type](text, cursor_position);
-
-                if (type == "complete" && result) {
-                    mp.commandv("script-message-to", "console", "complete",
-                                JSON.stringify(result[0]), result[1]);
-                }
-            }
-
-            if (type == "closed") {
-                mp.unregister_script_message("input-event");
-            }
-        })
-
-        return true;
+        t.prompt = String(t.prompt || "")
+        t.id = t.id || mp.script_name + t.prompt;
+        latest_log_id = t.id;
+        return input_request(t);
+    },
+    select: function(t) {
+        t.args = t.args || [];
+        return input_request(t);
     },
     terminate: function () {
-        mp.commandv("script-message-to", "console", "disable");
+        mp.commandv("script-message-to", "console", "disable", JSON.stringify({
+                        client_name: mp.script_name,
+                    }));
     },
     log: function (message, style, terminal_style) {
         mp.commandv("script-message-to", "console", "log", JSON.stringify({
+                        log_id: latest_log_id,
                         text: message,
                         style: style,
                         terminal_style: terminal_style,
                    }));
     },
     log_error: function (message) {
-        mp.commandv("script-message-to", "console", "log",
-                    JSON.stringify({ text: message, error: true }));
+        mp.msg.warn("log_error is deprecated and will be removed.")
+
+        mp.commandv("script-message-to", "console", "log", JSON.stringify({
+                        log_id: latest_log_id,
+                        text: message,
+                        error: true,
+                    }));
     },
     set_log: function (log) {
-        mp.commandv("script-message-to", "console", "set-log",
-                    JSON.stringify(log));
+        if (latest_log_id) {
+            mp.commandv("script-message-to", "console", "set-log",
+                        latest_log_id, JSON.stringify(log));
+        }
     }
 }
 
@@ -723,7 +774,7 @@ mp.osd_message = function osd_message(text, duration) {
 }
 
 mp.utils.subprocess = function subprocess(t) {
-    var cmd = { name: "subprocess", capture_stdout: true };
+    var cmd = { _name: "subprocess", capture_stdout: true };
     var new_names = { cancellable: "playback_only", max_size: "capture_size" };
     for (var k in t)
         cmd[new_names[k] || k] = t[k];

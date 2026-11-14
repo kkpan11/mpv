@@ -1,9 +1,9 @@
 #include <limits.h>
 
 #include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 
 #include "common/common.h"
-#include "common/global.h"
 #include "img_utils.h"
 #include "sub/draw_bmp.h"
 #include "sub/osd.h"
@@ -135,8 +135,10 @@ static const struct entry repack_tests[] = {
     {3, 1, -AV_PIX_FMT_BGR444BE,    {P16(SW16(15), SW16(15 << 4), SW16(15 << 8))},
            IMGFMT_GBRP,             {P8(0,0xFF,0), P8(0,0,0xFF), P8(0xFF,0,0)},
         .flags = REPACK_CREATE_EXPAND_8BIT},
-    {1, 1, IMGFMT_RGB30,            {P32((3 << 20) | (2 << 10) | 1)},
+    {1, 1, IMGFMT_X2RGB10,          {P32((3 << 20) | (2 << 10) | 1)},
            -AV_PIX_FMT_GBRP10,      {P16(2), P16(1), P16(3)}},
+    {1, 1, IMGFMT_X2BGR10,          {P32((3 << 20) | (2 << 10) | 1)},
+           -AV_PIX_FMT_GBRP10,      {P16(2), P16(3), P16(1)}},
     {1, 1, -AV_PIX_FMT_X2RGB10BE,   {P32(SW32((3 << 20) | (2 << 10) | 1))},
            -AV_PIX_FMT_GBRP10,      {P16(2), P16(1), P16(3)}},
     {8, 1, -AV_PIX_FMT_MONOWHITE,   {P8(0xAA)},
@@ -172,6 +174,8 @@ static const struct entry repack_tests[] = {
     {8, 1, -AV_PIX_FMT_UYYVYY411,   {P8(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)},
            -AV_PIX_FMT_YUV411P,     {P8(2, 3, 5, 6, 8, 9, 11, 12),
                                      P8(1, 7), P8(4, 10)}},
+    {1, 1, IMGFMT_RGBAF16,          {P16(0x1a1b, 0x2a2b, 0x3a3b, 0x4a4b)},
+           -AV_PIX_FMT_GBRAP16,     {P16(0x2a2b), P16(0x3a3b), P16(0x1a1b), P16(0x4a4b)}},
 };
 
 static bool is_true_planar(int imgfmt)
@@ -196,10 +200,10 @@ static int try_repack(FILE *f, int imgfmt, int flags, int not_if_fmt)
 
     // If both exists, they must be always symmetric.
     if (un && pa) {
-        assert(mp_repack_get_format_src(pa) == mp_repack_get_format_dst(un));
-        assert(mp_repack_get_format_src(un) == mp_repack_get_format_dst(pa));
-        assert(mp_repack_get_align_x(pa) == mp_repack_get_align_x(un));
-        assert(mp_repack_get_align_y(pa) == mp_repack_get_align_y(un));
+        mp_require(mp_repack_get_format_src(pa) == mp_repack_get_format_dst(un));
+        mp_require(mp_repack_get_format_src(un) == mp_repack_get_format_dst(pa));
+        mp_require(mp_repack_get_align_x(pa) == mp_repack_get_align_x(un));
+        mp_require(mp_repack_get_align_y(pa) == mp_repack_get_align_y(un));
     }
 
     int a = 0;
@@ -215,10 +219,12 @@ static int try_repack(FILE *f, int imgfmt, int flags, int not_if_fmt)
     // Skip the identity ones because they're uninteresting, and add too much
     // noise. But still make sure they behave as expected.
     if (a == imgfmt && b == imgfmt) {
-        assert(is_true_planar(imgfmt));
+        mp_require(is_true_planar(imgfmt));
         // (note that we require alpha-enabled zimg)
-        assert(mp_zimg_supports_in_format(imgfmt));
-        assert(un && pa);
+        if (sws_isSupportedInput(imgfmt)) {
+            mp_require(mp_zimg_supports_in_format(imgfmt));
+        }
+        mp_require(un && pa);
         talloc_free(pa);
         talloc_free(un);
         return b;
@@ -231,7 +237,7 @@ static int try_repack(FILE *f, int imgfmt, int flags, int not_if_fmt)
         return 0;
     }
 
-    assert(a == imgfmt);
+    mp_require(a == imgfmt);
     if (b && b == not_if_fmt) {
         talloc_free(pa);
         talloc_free(un);
@@ -271,7 +277,7 @@ static int try_repack(FILE *f, int imgfmt, int flags, int not_if_fmt)
         struct mp_image *ib = mp_image_alloc(fmt_b, e->w * 7 * ax, e->h * 6 * ay);
         int sx = 4 * ax, sy = 3 * ay, dx = 3 * ax, dy = 2 * ay;
 
-        assert(ia && ib);
+        mp_require(ia && ib);
 
         mp_image_params_guess_csp(&ia->params);
         mp_image_params_guess_csp(&ib->params);
@@ -290,7 +296,7 @@ static int try_repack(FILE *f, int imgfmt, int flags, int not_if_fmt)
             struct mp_image *srci = pack ? ib : ia;
 
             bool r = repack_config_buffers(repacker, 0, dsti, 0, srci, NULL);
-            assert(r);
+            mp_require(r);
 
             for (int p = 0; p < srci->num_planes; p++) {
                 uint8_t *ptr = mp_image_pixel_ptr(srci, p, sx, sy);
@@ -336,7 +342,7 @@ static void check_float_repack(int imgfmt, enum pl_color_system csp,
     int bpp = desc.component_size;
     int comp_bits = desc.component_size * 8 + MPMIN(desc.component_pad, 0);
 
-    assert(bpp == 1 || bpp == 2);
+    mp_require(bpp == 1 || bpp == 2);
 
     int w = 1 << (bpp * 8);
 
@@ -347,14 +353,14 @@ static void check_float_repack(int imgfmt, enum pl_color_system csp,
     }
 
     struct mp_image *src = mp_image_alloc(imgfmt, w, 1);
-    assert(src);
+    mp_require(src);
 
     src->params.repr.sys = csp;
     src->params.repr.levels = levels;
     mp_image_params_guess_csp(&src->params);
     // mpv may not allow all combinations
-    assert(src->params.repr.sys == csp);
-    assert(src->params.repr.levels == levels);
+    mp_require(src->params.repr.sys == csp);
+    mp_require(src->params.repr.levels == levels);
 
     for (int p = 0; p < src->num_planes; p++) {
         int val = 0;
@@ -374,13 +380,13 @@ static void check_float_repack(int imgfmt, enum pl_color_system csp,
         mp_repack_create_planar(src->imgfmt, false, REPACK_CREATE_PLANAR_F32);
     struct mp_repack *from_f =
         mp_repack_create_planar(src->imgfmt, true, REPACK_CREATE_PLANAR_F32);
-    assert(to_f && from_f);
+    mp_require(to_f && from_f);
 
     struct mp_image *z_f = mp_image_alloc(mp_repack_get_format_dst(to_f), w, 1);
     struct mp_image *r_f = mp_image_alloc(z_f->imgfmt, w, 1);
     struct mp_image *z_i = mp_image_alloc(src->imgfmt, w, 1);
     struct mp_image *r_i = mp_image_alloc(src->imgfmt, w, 1);
-    assert(z_f && r_f && z_i && r_i);
+    mp_require(z_f && r_f && z_i && r_i);
 
     z_f->params.color = r_f->params.color = z_i->params.color =
         r_i->params.color = src->params.color;
@@ -435,21 +441,21 @@ static void check_float_repack(int imgfmt, enum pl_color_system csp,
     talloc_free(from_f);
 }
 
-static bool try_draw_bmp(FILE *f, int imgfmt)
+static bool try_draw_bmp(FILE *f, int imgfmt, int w, int h)
 {
     bool ok = false;
 
-    struct mp_image *dst = mp_image_alloc(imgfmt, 64, 64);
+    struct mp_image *dst = mp_image_alloc(imgfmt, w, h);
     if (!dst)
         goto done;
 
     struct sub_bitmap sb = {
-        .bitmap = &(uint8_t[]){123},
-        .stride = 1,
-        .x = 1,
-        .y = 1,
-        .w = 1, .dw = 1,
-        .h = 1, .dh = 1,
+        .bitmap = &(uint8_t[]){0x55, 0xaa, 0x55, 0xaa},
+        .stride = 2,
+        .x = w - 2,
+        .y = h - 2,
+        .w = 2, .dw = 2,
+        .h = 2, .dh = 2,
 
         .libass = { .color = 0xDEDEDEDE },
     };
@@ -523,7 +529,21 @@ int main(int argc, char *argv[])
         int imgfmt = imgfmts[n];
 
         fprintf(f, "%-12s= ", mp_imgfmt_to_name(imgfmt));
-        try_draw_bmp(f, imgfmt);
+        try_draw_bmp(f, imgfmt, 64, 64);
+    }
+
+    fprintf(f, "\n");
+
+    { // try it at a few sizes
+        const int imgfmt = IMGFMT_RGB0;
+        fprintf(f, "1920x1080= ");
+        try_draw_bmp(f, imgfmt, 1920, 1080);
+        for(int off = -1; off <= 1; off++) {
+            fprintf(f, "78x%d= ", 64+off);
+            try_draw_bmp(f, imgfmt, 78, 64+off);
+            fprintf(f, "%dx11= ", 64+off);
+            try_draw_bmp(f, imgfmt, 64+off, 11);
+        }
     }
 
     fclose(f);

@@ -16,12 +16,9 @@
  */
 
 #include <string.h>
-#include <strings.h>
 #include <sys/types.h>
-#include <dirent.h>
 #include <math.h>
 #include <assert.h>
-#include <unistd.h>
 
 #include "config.h"
 
@@ -38,9 +35,9 @@
 #include "misc/bstr.h"
 #include "core.h"
 #include "client.h"
-#include "libmpv/client.h"
-#include "libmpv/render.h"
-#include "libmpv/stream_cb.h"
+#include "mpv/client.h"
+#include "mpv/render.h"
+#include "mpv/stream_cb.h"
 
 extern const struct mp_scripting mp_scripting_lua;
 extern const struct mp_scripting mp_scripting_cplugin;
@@ -92,8 +89,9 @@ static void run_script(struct mp_script_args *arg)
     if (arg->backend->load(arg) < 0)
         MP_ERR(arg, "Could not load %s script %s\n", arg->backend->name, arg->filename);
 
-    mpv_destroy(arg->client);
+    mpv_handle *client = arg->client;
     talloc_free(arg);
+    mpv_destroy(client);
 }
 
 static MP_THREAD_VOID script_thread(void *p)
@@ -106,14 +104,14 @@ static MP_THREAD_VOID script_thread(void *p)
 
 static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
 {
-    char *ext = mp_splitext(fname, NULL);
-    if (ext && strcasecmp(ext, "disable") == 0)
+    bstr ext = mp_get_ext(bstr0(fname));
+    if (bstrcasecmp0(ext, "disable") == 0)
         return 0;
 
     void *tmp = talloc_new(NULL);
 
     const char *path = NULL;
-    char *script_name = NULL;
+    const char *script_name = NULL;
     const struct mp_scripting *backend = NULL;
 
     struct stat s;
@@ -140,13 +138,13 @@ static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
             return -1;
         }
 
-        script_name = talloc_strdup(tmp, path);
-        mp_path_strip_trailing_separator(script_name);
-        script_name = mp_basename(script_name);
+        char *path_dup = talloc_strdup(tmp, path);
+        mp_path_strip_trailing_separator(path_dup);
+        script_name = mp_basename(path_dup);
     } else {
         for (int n = 0; scripting_backends[n]; n++) {
             const struct mp_scripting *b = scripting_backends[n];
-            if (ext && strcasecmp(ext, b->file_ext) == 0) {
+            if (bstrcasecmp0(ext, b->file_ext) == 0) {
                 backend = b;
                 break;
             }
@@ -169,7 +167,7 @@ static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
         // Create the client before creating the thread; otherwise a race
         // condition could happen, where MPContext is destroyed while the
         // thread tries to create the client.
-        .client = mp_new_client(mpctx->clients, script_name),
+        .client = mp_new_weak_client(mpctx->clients, script_name),
     };
 
     talloc_free(tmp);
@@ -181,7 +179,6 @@ static int64_t mp_load_script(struct MPContext *mpctx, const char *fname)
         return -1;
     }
 
-    mp_client_set_weak(arg->client);
     arg->log = mp_client_get_log(arg->client);
     int64_t id = mpv_client_id(arg->client);
 
@@ -214,7 +211,7 @@ static int compare_filename(const void *pa, const void *pb)
 {
     char *a = (char *)pa;
     char *b = (char *)pb;
-    return strcmp(a, b);
+    return strcasecmp(a, b);
 }
 
 static char **list_script_files(void *talloc_ctx, char *path)
@@ -243,16 +240,20 @@ static char **list_script_files(void *talloc_ctx, char *path)
 static void load_builtin_script(struct MPContext *mpctx, int slot, bool enable,
                                 const char *fname)
 {
-    assert(slot < MP_ARRAY_SIZE(mpctx->builtin_script_ids));
+    mp_assert(slot < MP_ARRAY_SIZE(mpctx->builtin_script_ids));
     int64_t *pid = &mpctx->builtin_script_ids[slot];
-    if (*pid > 0 && !mp_client_id_exists(mpctx, *pid))
+    if (*pid > 0 && !mp_client_id_exists(mpctx, *pid)) {
+        MP_DBG(mpctx, "Client for script %s is no longer alive. Marking as unloaded.\n", fname);
         *pid = 0; // died
+    }
     if ((*pid > 0) != enable) {
         if (enable) {
             *pid = mp_load_script(mpctx, fname);
         } else {
             char *name = mp_tprintf(22, "@%"PRIi64, *pid);
+            MP_DBG(mpctx, "Unloading script %s (disabled by option)\n", fname);
             mp_client_send_event(mpctx, name, 0, MPV_EVENT_SHUTDOWN, NULL);
+            // note: there is no synchronization of script exit
         }
     }
 }
@@ -265,6 +266,14 @@ void mp_load_builtin_scripts(struct MPContext *mpctx)
     load_builtin_script(mpctx, 3, mpctx->opts->lua_load_console, "@console.lua");
     load_builtin_script(mpctx, 4, mpctx->opts->lua_load_auto_profiles,
                         "@auto_profiles.lua");
+    load_builtin_script(mpctx, 5, mpctx->opts->lua_load_select, "@select.lua");
+    load_builtin_script(mpctx, 6, mpctx->opts->lua_load_positioning, "@positioning.lua");
+    load_builtin_script(mpctx, 7, mpctx->opts->lua_load_commands, "@commands.lua");
+
+    // select.lua uses context_menu.lua in D3D11 exclusive fullscreen.
+    struct m_config_option *co = m_config_get_co(mpctx->mconfig, bstr0("d3d11-exclusive-fs"));
+    bool context_menu = mpctx->opts->lua_load_context_menu || (co && *(bool *)co->data);
+    load_builtin_script(mpctx, 8, context_menu, "@context_menu.lua");
 }
 
 bool mp_load_scripts(struct MPContext *mpctx)
@@ -295,7 +304,7 @@ bool mp_load_scripts(struct MPContext *mpctx)
 
 #if HAVE_CPLUGINS
 
-#if !HAVE_WIN32
+#ifndef _WIN32
 #include <dlfcn.h>
 #endif
 
@@ -325,6 +334,7 @@ static void init_sym_table(struct mp_script_args *args, void *lib) {
     INIT_SYM(mpv_create_client);
     INIT_SYM(mpv_create_weak_client);
     INIT_SYM(mpv_load_config_file);
+    INIT_SYM(mpv_get_time_ns);
     INIT_SYM(mpv_get_time_us);
     INIT_SYM(mpv_free_node_contents);
     INIT_SYM(mpv_set_option);
@@ -395,7 +405,7 @@ error: ;
 
 const struct mp_scripting mp_scripting_cplugin = {
     .name = "cplugin",
-    #if HAVE_WIN32
+    #ifdef _WIN32
     .file_ext = "dll",
     #else
     .file_ext = "so",
@@ -435,23 +445,14 @@ static int load_run(struct mp_script_args *args)
         .detach = true,
     };
     struct mp_subprocess_result res;
-    mp_subprocess2(&opts, &res);
+    mp_subprocess(args->log, &opts, &res);
 
     // Closing these will (probably) make the client exit, if it really died.
-    // They _should_ be CLOEXEC, but are not, because
-    // posix_spawn_file_actions_adddup2() may not clear the CLOEXEC flag
-    // properly if by coincidence fd==src_fd.
     close(fds[0]);
     if (fds[1] >= 0)
         close(fds[1]);
 
-    if (res.error < 0) {
-        MP_ERR(args, "Starting '%s' failed: %s\n", args->filename,
-               mp_subprocess_err_str(res.error));
-        return -1;
-    }
-
-    return 0;
+    return res.error;
 }
 
 const struct mp_scripting mp_scripting_run = {

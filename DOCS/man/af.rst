@@ -8,6 +8,8 @@ syntax is:
     Setup a chain of audio filters. See ``--vf`` (`VIDEO FILTERS`_) for the
     full syntax.
 
+    This is an object settings list option. See `List Options`_ for details.
+
 .. note::
 
     To get a full list of available audio filters, see ``--af=help``.
@@ -187,6 +189,37 @@ Available filters are:
     ``window-size=<amount>``
         Length in milliseconds of the overlap-and-add window. (default: 12)
 
+``lavfi-tempo[=[filter=]<filter_name>]``
+    Scales audio tempo using ``atempo`` or ``ascale`` filters from FFmpeg's
+    libavfilter.
+
+    If ``ascale`` (Librempeg only) is not available in the loaded
+    libavfilter, ``atempo`` will be used as a fall-back.
+
+    This can be used in place of ``scaletempo`` and ``scaletempo2``.
+
+
+    .. admonition:: Examples
+
+        ``mpv --af=lavfi-tempo --speed=1.2 media.ogg``
+            Would play media at 1.2x normal speed at normal pitch with tempo
+            scaled by the ``atempo`` filter from lavfi.
+
+        ``mpv --af=lavfi-tempo=atempo --speed=1.2 media.ogg``
+            Same as above.
+
+        ``mpv --af=lavfi-tempo=filter=atempo --speed=1.2 media.ogg``
+            Same as above.
+
+        ``mpv --af=lavfi-tempo=ascale --speed=1.2 media.ogg``
+            Would play media at 1.2x normal speed at normal pitch with tempo
+            scaled by the ``ascale`` filter from lavfi, unless the filter is
+            not available, then ``atempo`` will be used as a fall-back.
+
+        ``mpv --af=lavfi-tempo=filter=ascale --speed=1.2 media.ogg``
+            Same as above.
+
+
 ``rubberband``
     High quality pitch correction with librubberband. This can be used in place
     of ``scaletempo`` and ``scaletempo2``, and will be used to adjust audio pitch
@@ -226,10 +259,7 @@ Available filters are:
         using the standard ``speed`` property, not ``af-command``.
 
     ``multiply-pitch <factor>``
-        Multiply the current value of ``<pitch-scale>`` dynamically.  For
-        example: 0.5 to go down by an octave, 1.5 to go up by a perfect fifth.
-        If you want to go up or down by semi-tones, use 1.059463094352953 and
-        0.9438743126816935
+        Multiply the current value of ``<pitch-scale>`` dynamically.
 
 ``lavfi=graph``
     Filter audio using FFmpeg's libavfilter.

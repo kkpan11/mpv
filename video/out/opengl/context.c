@@ -57,11 +57,13 @@ const struct m_sub_options opengl_conf = {
     .opts = (const struct m_option[]) {
         {"opengl-glfinish", OPT_BOOL(use_glfinish)},
         {"opengl-waitvsync", OPT_BOOL(waitvsync)},
-        {"opengl-swapinterval", OPT_INT(swapinterval)},
+        {"opengl-swapinterval", OPT_INT(swapinterval), .flags = UPDATE_VO},
         {"opengl-check-pattern-a", OPT_INT(vsync_pattern[0])},
         {"opengl-check-pattern-b", OPT_INT(vsync_pattern[1])},
         {"opengl-es", OPT_CHOICE(gles_mode,
-            {"auto", GLES_AUTO}, {"yes", GLES_YES}, {"no", GLES_NO})},
+            {"auto", GLES_AUTO}, {"yes", GLES_YES}, {"no", GLES_NO}),
+            .flags = UPDATE_VO,
+        },
         {"opengl-early-flush", OPT_CHOICE(early_flush,
             {"no", FLUSH_NO}, {"yes", FLUSH_YES}, {"auto", FLUSH_AUTO})},
         {0},
@@ -75,9 +77,8 @@ const struct m_sub_options opengl_conf = {
 struct priv {
     GL *gl;
     struct mp_log *log;
-    struct ra_gl_ctx_params params;
+    struct ra_ctx_params params;
     struct opengl_opts *opts;
-    struct ra_swapchain_fns fns;
     GLuint main_fb;
     struct ra_tex *wrapped_fb; // corresponds to main_fb
     // for debugging:
@@ -123,11 +124,12 @@ void ra_gl_ctx_uninit(struct ra_ctx *ctx)
 
 static const struct ra_swapchain_fns ra_gl_swapchain_fns;
 
-bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
+bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_ctx_params params)
 {
     struct ra_swapchain *sw = ctx->swapchain = talloc_ptrtype(NULL, sw);
     *sw = (struct ra_swapchain) {
         .ctx = ctx,
+        .fns = &ra_gl_swapchain_fns,
     };
 
     struct priv *p = sw->priv = talloc_ptrtype(sw, p);
@@ -136,30 +138,15 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
         .log    = ctx->log,
         .params = params,
         .opts   = mp_get_config_group(p, ctx->global, &opengl_conf),
-        .fns    = ra_gl_swapchain_fns,
     };
 
-    sw->fns = &p->fns;
-
-    const struct ra_swapchain_fns *ext = p->params.external_swapchain;
-    if (ext) {
-        if (ext->color_depth)
-            p->fns.color_depth = ext->color_depth;
-        if (ext->start_frame)
-            p->fns.start_frame = ext->start_frame;
-        if (ext->submit_frame)
-            p->fns.submit_frame = ext->submit_frame;
-        if (ext->swap_buffers)
-            p->fns.swap_buffers = ext->swap_buffers;
-    }
-
     if (!gl->version && !gl->es)
-        return false;
+        goto fail;
 
     if (gl->mpgl_caps & MPGL_CAP_SW) {
         MP_WARN(p, "Suspected software renderer or indirect context.\n");
         if (ctx->opts.probing && !ctx->opts.allow_sw)
-            return false;
+            goto fail;
     }
 
     gl->debug_context = ctx->opts.debug;
@@ -171,7 +158,14 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
     }
 
     ctx->ra = ra_create_gl(p->gl, ctx->log);
-    return !!ctx->ra;
+    if (!ctx->ra)
+        goto fail;
+
+    return true;
+
+fail:
+    ra_gl_ctx_uninit(ctx);
+    return false;
 }
 
 void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo)
@@ -197,6 +191,12 @@ int ra_gl_ctx_color_depth(struct ra_swapchain *sw)
         return 0;
 
     if ((gl->es < 300 && !gl->version) || !(gl->mpgl_caps & MPGL_CAP_FB))
+        return 0;
+
+    // The *_SIZE attachment queries need GL_ARB_framebuffer_object or
+    // GL 3.0+; GL_EXT_framebuffer_object does not provide them.
+    if (gl->version && gl->version < 300 &&
+        !gl_check_extension(gl->extensions, "GL_ARB_framebuffer_object"))
         return 0;
 
     gl->BindFramebuffer(GL_FRAMEBUFFER, p->main_fb);
@@ -242,7 +242,7 @@ bool ra_gl_ctx_submit_frame(struct ra_swapchain *sw, const struct vo_frame *fram
     if (p->opts->use_glfinish)
         gl->Finish();
 
-    if (gl->FenceSync && !p->params.external_swapchain) {
+    if (gl->FenceSync && p->params.swap_buffers) {
         GLsync fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (fence)
             MP_TARRAY_APPEND(p, p->vsync_fences, p->num_vsync_fences, fence);
@@ -270,7 +270,7 @@ static void check_pattern(struct priv *p, int item)
         p->matches++;
     } else {
         p->mismatches++;
-        MP_WARN(p, "wrong pattern, expected %d got %d (hit: %d, mis: %d)\n",
+        MP_WARN(p, "wrong pattern, expected %d got %d (hit: %d, miss: %d)\n",
                 expected, item, p->matches, p->mismatches);
     }
 }
@@ -315,8 +315,26 @@ static void ra_gl_ctx_get_vsync(struct ra_swapchain *sw,
         p->params.get_vsync(sw->ctx, info);
 }
 
+static bool ra_gl_ctx_set_color(struct ra_swapchain *sw, struct mp_image_params *params)
+{
+    struct priv *p = sw->priv;
+    if (p->params.set_color)
+        return p->params.set_color(sw->ctx, params);
+    return false;
+}
+
+static pl_color_space_t ra_gl_ctx_target_csp(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.preferred_csp)
+        return p->params.preferred_csp(sw->ctx);
+    return (pl_color_space_t){0};
+}
+
 static const struct ra_swapchain_fns ra_gl_swapchain_fns = {
     .color_depth   = ra_gl_ctx_color_depth,
+    .set_color     = ra_gl_ctx_set_color,
+    .target_csp    = ra_gl_ctx_target_csp,
     .start_frame   = ra_gl_ctx_start_frame,
     .submit_frame  = ra_gl_ctx_submit_frame,
     .swap_buffers  = ra_gl_ctx_swap_buffers,

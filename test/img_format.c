@@ -1,5 +1,6 @@
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/version.h>
 
 #include "img_utils.h"
 #include "options/path.h"
@@ -8,9 +9,6 @@
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/sws_utils.h"
-
-static enum AVPixelFormat pixfmt_unsup[100];
-static int num_pixfmt_unsup;
 
 static const char *comp_type(enum mp_component_type type)
 {
@@ -68,7 +66,7 @@ int main(int argc, char *argv[])
             fprintf(f, "    {");
             for (int n = 0; n < MP_MAX_PLANES; n++) {
                 if (n >= d.num_planes) {
-                    assert(d.bpp[n] == 0 && d.xs[n] == 0 && d.ys[n] == 0);
+                    mp_require(d.bpp[n] == 0 && d.xs[n] == 0 && d.ys[n] == 0);
                     continue;
                 }
                 fprintf(f, "%d/[%d:%d] ", d.bpp[n], d.xs[n], d.ys[n]);
@@ -84,6 +82,24 @@ int main(int argc, char *argv[])
                 fprintf(f, " endian_bytes=%d", 1 << d.endian_shift);
             for (int x = 0; x < MP_NUM_COMPONENTS; x++) {
                 struct mp_imgfmt_comp_desc cm = d.comps[x];
+                if (avd && x < avd->nb_components) {
+                    const AVComponentDescriptor *cd = &avd->comp[x];
+                    // Validate only if padding is not 0. fill_pixdesc_layout()
+                    // uses some heuristics to convert AVComponentDescriptor
+                    // to mp_imgfmt_comp_desc. Some formats, mostly packed ones,
+                    // are not fully supported. See fill_pixdesc_layout()
+                    // for more details.
+                    if (cm.pad) {
+                        struct pl_bit_encoding be = {
+                            .sample_depth = cm.size,
+                            .color_depth = cm.size - abs(cm.pad),
+                            .bit_shift = MPMAX(0, cm.pad),
+                        };
+                        mp_require(be.color_depth == cd->depth);
+                        mp_require(be.sample_depth == MP_ALIGN_UP(cd->depth, 8));
+                        mp_require(be.bit_shift == cd->shift);
+                    }
+                }
                 fprintf(f, " {");
                 if (cm.plane == n) {
                     if (cm.size) {
@@ -91,24 +107,24 @@ int main(int argc, char *argv[])
                         if (cm.pad)
                             fprintf(f, "/%d", cm.pad);
                     } else {
-                        assert(cm.offset == 0);
-                        assert(cm.pad == 0);
+                        mp_require(cm.offset == 0);
+                        mp_require(cm.pad == 0);
                     }
                 }
                 fprintf(f, "}");
                 if (!(d.flags & (MP_IMGFLAG_PACKED_SS_YUV | MP_IMGFLAG_HAS_COMPS)))
                 {
-                    assert(cm.size == 0);
-                    assert(cm.offset == 0);
-                    assert(cm.pad == 0);
+                    mp_require(cm.size == 0);
+                    mp_require(cm.offset == 0);
+                    mp_require(cm.pad == 0);
                 }
             }
             fprintf(f, "\n");
             if (d.flags & MP_IMGFLAG_PACKED_SS_YUV) {
-                assert(!(d.flags & MP_IMGFLAG_HAS_COMPS));
+                mp_require(!(d.flags & MP_IMGFLAG_HAS_COMPS));
                 uint8_t offsets[10];
                 bool r = mp_imgfmt_get_packed_yuv_locations(mpfmt, offsets);
-                assert(r);
+                mp_require(r);
                 fprintf(f, "       luma_offsets=[");
                 for (int x = 0; x < d.align_x; x++)
                     fprintf(f, " %d", offsets[x]);
@@ -122,7 +138,7 @@ int main(int argc, char *argv[])
             fr->width = 128;
             fr->height = 128;
             int err = av_frame_get_buffer(fr, MP_IMAGE_BYTE_ALIGN);
-            assert(err >= 0);
+            mp_require(err >= 0);
             struct mp_image *mpi = mp_image_alloc(mpfmt, fr->width, fr->height);
             if (mpi) {
                 // A rather fuzzy test, which might fail even if there's no bug.
@@ -188,11 +204,6 @@ int main(int argc, char *argv[])
                 fprintf(f, "    %d: p=%-2d st=%-2d o=%-2d sh=%-2d d=%d\n",
                         n, cd->plane, cd->step, cd->offset, cd->shift, cd->depth);
             }
-            for (int n = avd->nb_components; n < 4; n++) {
-                const AVComponentDescriptor *cd = &avd->comp[n];
-                assert(!cd->plane && !cd->step && !cd->offset && !cd->shift &&
-                       !cd->depth);
-            }
         }
 
         const AVPixFmtDescriptor *avd2 = av_pix_fmt_desc_next(NULL);
@@ -202,11 +213,6 @@ int main(int argc, char *argv[])
             if (mpfmt2 == mpfmt && pixfmt2 != pixfmt)
                 fprintf(f, "  Ambiguous alias: %s\n", avd2->name);
         }
-    }
-
-    for (int z = 0; z < num_pixfmt_unsup; z++) {
-        const AVPixFmtDescriptor *avd = av_pix_fmt_desc_get(pixfmt_unsup[z]);
-        fprintf(f, "Unsupported: %s\n", avd->name);
     }
 
     fclose(f);

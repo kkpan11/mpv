@@ -1,5 +1,7 @@
 #pragma once
 
+#include <libplacebo/colorspace.h>
+
 #include "video/out/vo.h"
 #include "video/csputils.h"
 
@@ -10,8 +12,9 @@ struct ra_ctx_opts {
     bool want_alpha;      // create an alpha framebuffer if possible
     bool debug;           // enable debugging layers/callbacks etc.
     bool probing;        // the backend was auto-probed
+    bool composition;    // enable swapchain composition
     struct m_obj_settings *context_list; // list of `ra_ctx_fns.name` to probe
-    char *context_type;  // filter by `ra_ctx_fns.type`
+    struct m_obj_settings *context_type_list;  // list of `ra_ctx_fns.type` to probe
 };
 
 extern const struct m_sub_options ra_ctx_conf;
@@ -56,6 +59,40 @@ struct ra_ctx_fns {
     void (*uninit)(struct ra_ctx *ctx);
 };
 
+typedef struct pl_color_space pl_color_space_t;
+
+// These are a set of helpers for ra_ctx providers based on ra_gl.
+// The init function also initializes ctx->ra and ctx->swapchain, so the user
+// doesn't have to do this manually. (Similarly, the uninit function will
+// clean them up)
+
+struct ra_ctx_params {
+    // For special contexts (i.e. wayland) that want to check visibility
+    // before drawing a frame.
+    bool (*check_visible)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.color_depth.
+    int (*color_depth)(struct ra_ctx *ctx);
+
+    // Preferred device color space. Optional.
+    pl_color_space_t (*preferred_csp)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.target_ref_luma. Optional.
+    float (*preferred_ref_luma)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.set_color. Optional.
+    bool (*set_color)(struct ra_ctx *ctx, struct mp_image_params *params);
+
+    // See ra_swapchain_fns.get_vsync.
+    void (*get_vsync)(struct ra_ctx *ctx, struct vo_vsync_info *info);
+
+    // Set to the platform-specific function to swap buffers, like
+    // glXSwapBuffers, eglSwapBuffers etc. This will be called by
+    // ra_gl_ctx_swap_buffers. Required unless you either never call that
+    // function or if you override it yourself.
+    void (*swap_buffers)(struct ra_ctx *ctx);
+};
+
 // Extra struct for the swapchain-related functions so they can be easily
 // inherited from helpers.
 struct ra_swapchain {
@@ -77,6 +114,17 @@ struct ra_fbo {
 struct ra_swapchain_fns {
     // Gets the current framebuffer depth in bits (0 if unknown). Optional.
     int (*color_depth)(struct ra_swapchain *sw);
+
+    // Target device color space. Optional.
+    pl_color_space_t (*target_csp)(struct ra_swapchain *sw);
+
+    // Target device reference luminance in nits, i.e. the luminance at which
+    // the system displays diffuse (SDR) white. Returns 0 if unknown. Optional.
+    float (*target_ref_luma)(struct ra_swapchain *sw);
+
+    // Call into backends so they can use the appropriate platform-specific
+    // functions to configure color spaces. Returns true if request was handled.
+    bool (*set_color)(struct ra_swapchain *sw, struct mp_image_params *params);
 
     // Called when rendering starts. Returns NULL on failure. This must be
     // followed by submit_frame, to submit the rendered frame. This function

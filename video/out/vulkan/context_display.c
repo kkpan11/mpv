@@ -26,7 +26,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "libmpv/render_gl.h"
+#include "mpv/render_gl.h"
 #include "video/out/drm_common.h"
 #endif
 
@@ -279,6 +279,7 @@ const struct m_sub_options vulkan_display_conf = {
     },
     .size = sizeof(struct vulkan_display_opts),
     .defaults = &(struct vulkan_display_opts) {0},
+    .change_flags = UPDATE_VO,
 };
 
 struct priv {
@@ -286,6 +287,7 @@ struct priv {
     struct vulkan_display_opts *opts;
     uint32_t width;
     uint32_t height;
+    uint32_t refresh_rate;
 
 #if HAVE_DRM
     struct mpv_opengl_drm_params_v2 drm_params;
@@ -307,7 +309,7 @@ static void open_render_fd(struct ra_ctx *ctx, const char *render_path)
 static bool drm_setup(struct ra_ctx *ctx, int display_idx,
                       VkPhysicalDevicePCIBusInfoPropertiesEXT *pci_props)
 {
-    drmDevice *devs[32] = {};
+    drmDevice *devs[32] = {0};
     int count = drmGetDevices2(0, devs, MP_ARRAY_SIZE(devs));
     for (int i = 0; i < count; i++) {
         drmDevice *dev = devs[i];
@@ -375,6 +377,10 @@ static bool display_init(struct ra_ctx *ctx)
 
     VkDisplayModePropertiesKHR *mode = NULL;
 
+#if HAVE_DRM
+    p->drm_params.fd = -1;
+    p->drm_params.render_fd = -1;
+#endif
     p->opts = mp_get_config_group(p, ctx->global, &vulkan_display_conf);
     int display_idx = p->opts->display;
     int mode_idx = p->opts->mode;
@@ -437,8 +443,9 @@ static bool display_init(struct ra_ctx *ctx)
 
     p->width = mode->parameters.visibleRegion.width;
     p->height = mode->parameters.visibleRegion.height;
+    p->refresh_rate = mode->parameters.refreshRate;
 
-    struct ra_vk_ctx_params params = {0};
+    struct ra_ctx_params params = {0};
     if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_FIFO_KHR))
         goto error;
 
@@ -470,17 +477,17 @@ static bool display_reconfig(struct ra_ctx *ctx)
 
 static int display_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    struct priv *p = ctx->priv;
+    switch (request) {
+    case VOCTRL_GET_DISPLAY_FPS:
+        *(double*)arg = p->refresh_rate / 1000.0;
+        return VO_TRUE;
+    case VOCTRL_GET_DISPLAY_RES:
+        ((int *)arg)[0] = p->width;
+        ((int *)arg)[1] = p->height;
+        return VO_TRUE;
+    }
     return VO_NOTIMPL;
-}
-
-static void display_wakeup(struct ra_ctx *ctx)
-{
-    // TODO
-}
-
-static void display_wait_events(struct ra_ctx *ctx, int64_t until_time_ns)
-{
-    // TODO
 }
 
 const struct ra_ctx_fns ra_ctx_vulkan_display = {
@@ -489,8 +496,6 @@ const struct ra_ctx_fns ra_ctx_vulkan_display = {
     .description    = "VK_KHR_display",
     .reconfig       = display_reconfig,
     .control        = display_control,
-    .wakeup         = display_wakeup,
-    .wait_events    = display_wait_events,
     .init           = display_init,
     .uninit         = display_uninit,
 };

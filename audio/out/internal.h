@@ -28,7 +28,7 @@ struct ao {
     int samplerate;
     struct mp_chmap channels;
     int format;                 // one of AF_FORMAT_...
-    int bps;                    // bytes per second (per plane)
+    int64_t bps;                // bytes per second (per plane)
     int sstride;                // size of a sample on each plane
                                 // (format_size*num_channels/num_planes)
     int num_planes;
@@ -54,6 +54,9 @@ struct ao {
 
     // Application name to report to the audio API.
     char *client_name;
+
+    // Whether mpv should set the media role to the audio server
+    bool set_media_role;
 
     // Used during init: if init fails, redirect to this ao
     char *redirect;
@@ -131,10 +134,6 @@ struct ao_driver {
     const char *name;
     // Description shown with --ao=help.
     const char *description;
-    // This requires waiting for a AO_EVENT_INITIAL_UNBLOCK event before the
-    // first write() call is done. Encode mode uses this, and push mode
-    // respects it automatically (don't use with pull mode).
-    bool initially_blocked;
     // If true, write units of entire frames. The write() call is modified to
     // use data==mp_aframe. Useful for encoding AO only.
     bool write_frames;
@@ -201,9 +200,7 @@ struct ao_driver {
 
 // These functions can be called by AOs.
 
-int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns);
-MP_WARN_UNUSED_RESULT
-int ao_read_data_nonblocking(struct ao *ao, void **data, int samples, int64_t out_time_ns);
+int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, bool *eof, bool pad_silence, bool blocking);
 
 bool ao_chmap_sel_adjust(struct ao *ao, const struct mp_chmap_sel *s,
                          struct mp_chmap *map);
@@ -235,5 +232,7 @@ void ao_wakeup(struct ao *ao);
 
 int ao_read_data_converted(struct ao *ao, struct ao_convert_fmt *fmt,
                            void **data, int samples, int64_t out_time_ns);
+
+void ao_stop_streaming(struct ao *ao);
 
 #endif

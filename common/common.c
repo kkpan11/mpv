@@ -44,7 +44,7 @@
 // %T: milliseconds (000-999)
 char *mp_format_time_fmt(const char *fmt, double time)
 {
-    if (time == MP_NOPTS_VALUE)
+    if (time == MP_NOPTS_VALUE || !(fabs(time) < 0x1p63))
         return talloc_strdup(NULL, "unknown");
     char *sign = time < 0 ? "-" : "";
     time = time < 0 ? -time : time;
@@ -213,7 +213,7 @@ int mp_rect_subtract(const struct mp_rect *rc1, const struct mp_rect *rc2,
 int mp_snprintf_cat(char *str, size_t size, const char *format, ...)
 {
     size_t len = strnlen(str, size);
-    assert(!size || len < size); // str with no 0-termination is not allowed
+    mp_assert(!size || len < size); // str with no 0-termination is not allowed
     int r;
     va_list ap;
     va_start(ap, format);
@@ -273,7 +273,7 @@ static bool mp_parse_escape(void *talloc_ctx, bstr *dst, bstr *code)
     if (code->start[0] == 'u' && code->len >= 5) {
         bstr num = bstr_splice(*code, 1, 5);
         uint32_t c = bstrtoll(num, &num, 16);
-        if (num.len)
+        if (num.len || c > 0x10FFFF)
             return false;
         if (c >= 0xd800 && c <= 0xdbff) {
             if (code->len < 5 + 6 // udddd + \udddd
@@ -399,7 +399,7 @@ char **mp_dup_str_array(void *tctx, char **s)
 //  mp_log2(32) == 5
 unsigned int mp_log2(uint32_t v)
 {
-#if defined(__GNUC__) && __GNUC__ >= 4
+#if (defined(__GNUC__) && __GNUC__ >= 4) || defined(__clang__)
     return v ? 31 - __builtin_clz(v) : 0;
 #else
     for (int x = 31; x >= 0; x--) {
@@ -427,6 +427,11 @@ uint32_t mp_round_next_power_of_2(uint32_t v)
 
 int mp_lcm(int x, int y)
 {
-    assert(x && y);
+    mp_assert(x && y);
     return x * (y / av_gcd(x, y));
+}
+
+int64_t mp_gcd(int64_t x, int64_t y)
+{
+    return av_gcd(x, y);
 }

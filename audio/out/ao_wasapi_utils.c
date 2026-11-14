@@ -20,9 +20,17 @@
 #include <math.h>
 
 #include <windows.h>
-#include <mmsystem.h>
+// Workaround for redefinition of some guids in mingw. ks.h has to be included
+// before other ks*.h headers, but mingw fails then.
+#ifdef __MINGW32__
 #include <mmreg.h>
 #include <ksguid.h>
+#else
+#include <ks.h>
+#include <ksguid.h>
+#include <mmreg.h>
+#endif
+#include <mmsystem.h>
 #include <ksmedia.h>
 #include <avrt.h>
 #include <propsys.h>
@@ -33,6 +41,40 @@
 #include "osdep/io.h"
 #include "osdep/strnlen.h"
 #include "ao_wasapi.h"
+
+#ifdef _MSC_VER
+// Define some GUIDs that are defined only in C++ interfaces.
+DEFINE_GUID(KSDATAFORMAT_SPECIFIER_NONE,
+            0xf6417d6, 0xc318, 0x11d0, 0xa4, 0x3f,
+            0, 0xa0, 0xc9, 0x22, 0x31, 0x96);
+DEFINE_GUID(CLSID_MMDeviceEnumerator,
+            0xbcde0395, 0xe52f, 0x467c, 0x8e, 0x3d,
+            0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e);
+DEFINE_GUID(IID_IAudioClient,
+            0x1cb9ad4c, 0xdbfa, 0x4c32, 0xb1, 0x78, 0xc2,
+            0xf5, 0x68, 0xa7, 0x03, 0xb2);
+DEFINE_GUID(IID_IAudioClock,
+            0xcd63314f, 0x3fba, 0x4a1b, 0x81, 0x2c, 0xef, 0x96,
+            0x35, 0x87, 0x28, 0xe7);
+DEFINE_GUID(IID_IAudioEndpointVolume,
+            0x5cdf2c82, 0x841e, 0x4546, 0x97, 0x22,
+            0x0c, 0xf7, 0x40, 0x78, 0x22, 0x9a);
+DEFINE_GUID(IID_IAudioRenderClient,
+            0xf294acfc, 0x3146, 0x4483, 0xa7, 0xbf,
+            0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2);
+DEFINE_GUID(IID_IAudioSessionControl,
+            0xf4b1a599, 0x7266, 0x4319, 0xa8, 0xca,
+            0xe7, 0x0a, 0xcb, 0x11, 0xe8, 0xcd);
+DEFINE_GUID(IID_IMMDeviceEnumerator,
+            0xa95664d2, 0x9614, 0x4f35, 0xa7, 0x46,
+            0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6);
+DEFINE_GUID(IID_IMMNotificationClient,
+            0x7991eec9, 0x7e89, 0x4d85, 0x83, 0x90,
+            0x6c, 0x70, 0x3c, 0xec, 0x60, 0xc0);
+DEFINE_GUID(IID_ISimpleAudioVolume,
+            0x87ce5498, 0x68d6, 0x44e5, 0x92, 0x15,
+            0x6d, 0xa4, 0x7e, 0xf8, 0x83, 0xd8);
+#endif
 
 #ifndef KSDATAFORMAT_SUBTYPE_IEC61937_DTS
 DEFINE_GUID(KSDATAFORMAT_SUBTYPE_IEC61937_DTS,
@@ -103,6 +145,8 @@ static const struct wasapi_sample_fmt wasapi_formats[] = {
     {AF_FORMAT_S_TRUEHD, 16, 16, &KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP},
     {AF_FORMAT_S_EAC3,  16, 16, &KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS},
     {AF_FORMAT_S_DTSHD, 16, 16, &KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD},
+    // DSD-over-PCM
+    {AF_FORMAT_S_DOP,   32, 24, &KSDATAFORMAT_SUBTYPE_PCM},
     {0},
 };
 
@@ -158,10 +202,12 @@ static void set_waveformat(WAVEFORMATEXTENSIBLE *wformat,
     wformat->SubFormat                   = *format_to_subtype(format->mp_format);
     wformat->Samples.wValidBitsPerSample = format->used_msb;
 
-    uint64_t chans = mp_chmap_to_waveext(channels);
+    bool unknown = mp_chmap_is_unknown(channels);
+    uint64_t chans = unknown ? KSAUDIO_SPEAKER_DIRECTOUT
+                             : mp_chmap_to_waveext(channels);
     wformat->dwChannelMask = chans;
 
-    if (wformat->Format.nChannels > 8 || wformat->dwChannelMask != chans) {
+    if (!unknown && (wformat->Format.nChannels > 8 || wformat->dwChannelMask != chans)) {
         // IAudioClient::IsFormatSupported tend to fallback to stereo for closest
         // format match when there are more channels. Remix to standard layout.
         // Also if input channel mask has channels outside 32-bits override it
@@ -186,7 +232,8 @@ static void change_waveformat_channels(WAVEFORMATEXTENSIBLE *wformat,
                                        struct mp_chmap *channels)
 {
     wformat->Format.nChannels = channels->num;
-    wformat->dwChannelMask    = mp_chmap_to_waveext(channels);
+    wformat->dwChannelMask    = mp_chmap_is_unknown(channels) ? KSAUDIO_SPEAKER_DIRECTOUT
+                                                              : mp_chmap_to_waveext(channels);
     update_waveformat_datarate(wformat);
 }
 
@@ -237,6 +284,9 @@ static bool chmap_from_waveformat(struct mp_chmap *channels,
     if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
         WAVEFORMATEXTENSIBLE *wformat = (WAVEFORMATEXTENSIBLE *)wf;
         mp_chmap_from_waveext(channels, wformat->dwChannelMask);
+        // Channels without a bit in the mask have no speaker position.
+        if (channels->num < wf->nChannels && wf->nChannels <= MP_NUM_CHANNELS)
+            mp_chmap_fill_na(channels, wf->nChannels);
     } else {
         mp_chmap_from_channels(channels, wf->nChannels);
     }
@@ -286,8 +336,9 @@ static bool set_ao_format(struct ao *ao, WAVEFORMATEX *wf,
     }
 
     // Do not touch the ao for passthrough, just assume that we set WAVEFORMATEX
-    // correctly.
-    if (af_fmt_is_pcm(format.mp_format)) {
+    // correctly. Checked on both sides, since the DoP wire format is plain
+    // 24-in-32 PCM and reverse maps to a PCM sample format.
+    if (af_fmt_is_pcm(format.mp_format) && af_fmt_is_pcm(ao->format)) {
         struct mp_chmap channels;
         if (!chmap_from_waveformat(&channels, wf)) {
             MP_ERR(ao, "Unable to construct channel map from WAVEFORMAT %s\n",
@@ -432,6 +483,10 @@ static bool find_formats_exclusive(struct ao *ao, WAVEFORMATEXTENSIBLE *wformat)
     if (try_format_exclusive(ao, wformat))
         return true;
 
+    // DoP must be played back bit-exactly at the requested rate.
+    if (ao->format == AF_FORMAT_S_DOP)
+        return false;
+
     if (af_fmt_is_spdif(ao->format)) {
         if (ao->format != AF_FORMAT_S_AC3) {
             // If the requested format failed and it is passthrough, but not
@@ -517,16 +572,15 @@ static bool find_formats(struct ao *ao)
     struct wasapi_state *state = ao->priv;
     struct mp_chmap channels = ao->channels;
 
-    if (mp_chmap_is_unknown(&channels))
-        mp_chmap_from_channels(&channels, channels.num);
-    mp_chmap_reorder_to_waveext(&channels);
+    if (!mp_chmap_is_unknown(&channels))
+        mp_chmap_reorder_to_waveext(&channels);
     if (!mp_chmap_is_valid(&channels))
         mp_chmap_from_channels(&channels, 2);
 
     struct wasapi_sample_fmt alt_formats[MP_ARRAY_SIZE(wasapi_formats)];
     wasapi_get_best_sample_formats(ao->format, alt_formats);
     struct wasapi_sample_fmt wasapi_format =
-        {AF_FORMAT_S16, 16, 16, &KSDATAFORMAT_SUBTYPE_PCM};;
+        {AF_FORMAT_S16, 16, 16, &KSDATAFORMAT_SUBTYPE_PCM};
     if (alt_formats[0].mp_format)
         wasapi_format = alt_formats[0];
 
@@ -534,7 +588,7 @@ static bool find_formats(struct ao *ao)
     WAVEFORMATEXTENSIBLE wformat;
     set_waveformat(&wformat, &wasapi_format, ao->samplerate, &channels);
 
-    if (state->opt_exclusive || af_fmt_is_spdif(ao->format)) {
+    if (state->opt_exclusive || !af_fmt_is_pcm(ao->format)) {
         share_mode = AUDCLNT_SHAREMODE_EXCLUSIVE;
         if(!find_formats_exclusive(ao, &wformat))
             return false;
@@ -586,7 +640,7 @@ static void init_session_display(struct wasapi_state *state, const char *name) {
                 mp_HRESULT_to_str(hr));
     }
 
-    assert(name);
+    mp_assert(name);
     if (!name)
         return;
 
@@ -601,7 +655,6 @@ exit_label:
     SAFE_RELEASE(state->pSessionControl);
     MP_WARN(state, "Error setting audio session name: %s\n",
             mp_HRESULT_to_str(hr));
-    return;
 }
 
 static void init_volume_control(struct wasapi_state *state)
@@ -611,7 +664,7 @@ static void init_volume_control(struct wasapi_state *state)
         MP_DBG(state, "Activating pEndpointVolume interface\n");
         hr = IMMDeviceActivator_Activate(state->pDevice,
                                          &IID_IAudioEndpointVolume,
-                                         CLSCTX_ALL, NULL,
+                                         CLSCTX_INPROC_SERVER, NULL,
                                          (void **)&state->pEndpointVolume);
         EXIT_ON_ERROR(hr);
 
@@ -803,7 +856,7 @@ static struct enumerator *create_enumerator(struct mp_log *log)
     struct enumerator *e = talloc_zero(NULL, struct enumerator);
     e->log = log;
     HRESULT hr = CoCreateInstance(
-        &CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator,
+        &CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER, &IID_IMMDeviceEnumerator,
         (void **)&e->pEnumerator);
     EXIT_ON_ERROR(hr);
 
@@ -871,7 +924,7 @@ static bool load_device(struct mp_log *l,
                            IMMDevice **ppDevice, LPWSTR deviceID)
 {
     IMMDeviceEnumerator *pEnumerator = NULL;
-    HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+    HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
                                   &IID_IMMDeviceEnumerator,
                                   (void **)&pEnumerator);
     EXIT_ON_ERROR(hr);
@@ -972,7 +1025,7 @@ bool wasapi_thread_init(struct ao *ao)
 {
     struct wasapi_state *state = ao->priv;
     MP_DBG(ao, "Init wasapi thread\n");
-    int64_t retry_wait = MP_TIME_US_TO_NS(1);
+    int64_t retry_wait = MP_TIME_MS_TO_NS(1);
     bool align_hack = false;
     HRESULT hr;
 
@@ -985,7 +1038,7 @@ retry:
 
         MP_DBG(ao, "Activating pAudioClient interface\n");
         hr = IMMDeviceActivator_Activate(state->pDevice, &IID_IAudioClient,
-                                         CLSCTX_ALL, NULL,
+                                         CLSCTX_INPROC_SERVER, NULL,
                                          (void **)&state->pAudioClient);
         if (FAILED(hr)) {
             MP_FATAL(ao, "Error activating device: %s\n",
@@ -1055,14 +1108,14 @@ retry:
         goto retry;
     case AUDCLNT_E_DEVICE_IN_USE:
     case AUDCLNT_E_DEVICE_INVALIDATED:
-        if (retry_wait > MP_TIME_US_TO_NS(8)) {
+        if (retry_wait > MP_TIME_MS_TO_NS(1000)) {
             MP_FATAL(ao, "Bad device retry failed\n");
             return false;
         }
         wasapi_thread_uninit(ao);
-        MP_WARN(ao, "Retrying in %"PRId64" ns\n", retry_wait);
+        MP_WARN(ao, "Retrying in %.0f ms\n", MP_TIME_NS_TO_MS(retry_wait));
         mp_sleep_ns(retry_wait);
-        retry_wait *= 2;
+        retry_wait *= 10;
         goto retry;
     }
     return SUCCEEDED(hr);

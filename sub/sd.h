@@ -5,13 +5,17 @@
 #include "demux/packet.h"
 #include "misc/bstr.h"
 
-// up to 210 ms overlaps or gaps are removed
-#define SUB_GAP_THRESHOLD 0.210
-// don't change timings if durations are smaller
-#define SUB_GAP_KEEP 0.4
 // slight offset when sub seeking or sub stepping
 #define SUB_SEEK_OFFSET 0.01
 #define SUB_SEEK_WITHOUT_VIDEO_OFFSET 0.1
+
+enum ass_style_override {
+    ASS_STYLE_OVERRIDE_NONE,
+    ASS_STYLE_OVERRIDE_YES,
+    ASS_STYLE_OVERRIDE_SCALE,
+    ASS_STYLE_OVERRIDE_FORCE,
+    ASS_STYLE_OVERRIDE_STRIP,
+};
 
 struct sd {
     struct mpv_global *global;
@@ -25,6 +29,7 @@ struct sd {
 
     struct attachment_list *attachments;
     struct mp_codec_params *codec;
+    const char *lang;
 
     // Set to false as soon as the decoder discards old subtitle events.
     // (only needed if sd_functions.accept_packets_in_advance == false)
@@ -47,6 +52,7 @@ struct sd_functions {
                                        int format, double pts);
     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
     struct sd_times (*get_times)(struct sd *sd, double pts);
+    struct sub_lines *(*get_lines)(struct sd *sd);
 };
 
 // lavc_conv.c
@@ -59,9 +65,21 @@ bool lavc_conv_is_styled(struct lavc_conv *priv);
 void lavc_conv_reset(struct lavc_conv *priv);
 void lavc_conv_uninit(struct lavc_conv *priv);
 
+struct mp_sub_filter_opts {
+    bool sub_filter_SDH;
+    bool sub_filter_SDH_harder;
+    char **sub_filter_SDH_enclosures;
+    bool rf_enable;
+    bool rf_plain;
+    char **rf_items;
+    char **jsre_items;
+    bool rf_warn;
+};
+
 struct sd_filter {
     struct mpv_global *global;
     struct mp_log *log;
+    struct demux_packet_pool *packet_pool;
     struct mp_sub_filter_opts *opts;
     const struct sd_filter_functions *driver;
 

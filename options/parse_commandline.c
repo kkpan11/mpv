@@ -23,7 +23,6 @@
 #include <stdbool.h>
 
 #include "osdep/io.h"
-#include "common/global.h"
 #include "common/msg.h"
 #include "common/msg_control.h"
 #include "m_option.h"
@@ -51,7 +50,7 @@ struct parse_state {
 // Returns true if more args, false if all parsed or an error occurred.
 static bool split_opt(struct parse_state *p)
 {
-    assert(!p->error);
+    mp_assert(!p->error);
 
     if (!p->argv || !p->argv[0])
         return false;
@@ -96,13 +95,14 @@ static bool split_opt(struct parse_state *p)
     return true;
 }
 
-#ifdef __MINGW32__
+#ifdef _WIN32
 static void process_non_option(struct playlist *files, const char *arg)
 {
     glob_t gg;
 
-    // Glob filenames on Windows (cmd.exe doesn't do this automatically)
-    if (glob(arg, 0, NULL, &gg)) {
+    // Glob filenames with wildcards on Windows (cmd.exe doesn't do this
+    // automatically)
+    if (!strpbrk(arg, "*?") || glob(arg, 0, NULL, &gg)) {
         playlist_append_file(files, arg);
     } else {
         for (int i = 0; i < gg.gl_pathc; i++)
@@ -129,7 +129,7 @@ int m_config_parse_mp_command_line(m_config_t *config, struct playlist *files,
     int local_params_count = 0;
     struct playlist_param *local_params = 0;
 
-    assert(config != NULL);
+    mp_assert(config != NULL);
 
     mode = GLOBAL;
 
@@ -157,7 +157,7 @@ int m_config_parse_mp_command_line(m_config_t *config, struct playlist *files,
                     goto err_out;
                 }
                 mode = LOCAL;
-                assert(!local_start);
+                mp_assert(!local_start);
                 local_start = playlist_get_last(files);
                 continue;
             }

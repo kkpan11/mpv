@@ -28,8 +28,9 @@
 
 #include "config.h"
 
-#include "libmpv/render_gl.h"
+#include "mpv/render_gl.h"
 #include "options/m_config.h"
+#include "osdep/io.h"
 #include "video/fmt-conversion.h"
 #include "video/out/drm_common.h"
 #include "video/out/gpu/hwdec.h"
@@ -264,7 +265,7 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
 
     // Now actually dup the fds
     for (int i = 0; i < desc->nb_objects; i++) {
-        p->desc.objects[i].fd = fcntl(desc->objects[i].fd, F_DUPFD_CLOEXEC, 0);
+        p->desc.objects[i].fd = mp_dup_cloexec(desc->objects[i].fd);
         if (p->desc.objects[i].fd == -1) {
             MP_ERR(mapper, "Failed to duplicate dmabuf fd: %s\n",
                    mp_strerror(errno));
@@ -307,6 +308,7 @@ const struct ra_hwdec_driver ra_hwdec_drmprime = {
     .name = "drmprime",
     .priv_size = sizeof(struct priv_owner),
     .imgfmts = {IMGFMT_DRMPRIME, 0},
+    .device_type = AV_HWDEVICE_TYPE_DRM,
     .init = init,
     .uninit = uninit,
     .mapper = &(const struct ra_hwdec_mapper_driver){
